@@ -86,6 +86,8 @@ if TYPE_CHECKING or not _is_config_mode():
     from . import dataclasses
     from . import structural
     from . import cpp
+    from . import std
+    from .std import Analyzer, ConstIntBound, IntervalSet, ModularSet
 
     # optional module to speedup dlpack conversion
     from . import _optional_torch_c_dlpack
@@ -105,11 +107,17 @@ if TYPE_CHECKING or not _is_config_mode():
         float32,
         float16,
         bfloat16,
+        float8_e3m4,
+        float8_e4m3,
+        float8_e4m3b11fnuz,
         float8_e4m3fn,
         float8_e4m3fnuz,
         float8_e5m2,
         float8_e5m2fnuz,
         float8_e8m0fnu,
+        float6_e2m3fn,
+        float6_e3m2fn,
+        float4_e2m1fn,
         float4_e2m1fnx2,
     )
 elif sys.platform.startswith("win32"):
@@ -128,13 +136,17 @@ except ImportError:
 
 __all__ = [
     "LIB",
+    "Analyzer",
     "Array",
+    "ConstIntBound",
     "DLDeviceType",
     "Device",
     "Dict",
     "Function",
+    "IntervalSet",
     "List",
     "Map",
+    "ModularSet",
     "Module",
     "Object",
     "ObjectConvertible",
@@ -164,6 +176,7 @@ __all__ = [
     "register_object",
     "remove_global_func",
     "serialization",
+    "std",
     "structural",
     "structural_equal",
     "structural_hash",
