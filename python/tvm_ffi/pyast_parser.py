@@ -113,6 +113,14 @@ class IRParser:
         # Dialect callbacks — set by surface objects before visit_body
         self.create_var: Callable = lambda name, ann=None: name
         self.make_assign: Callable | None = None
+        self.make_func: Callable | None = None
+        self.make_for: Callable | None = None
+        # SyntaxContext — scope-determined statement handlers
+        self.make_store: Callable | None = None
+        # SyntaxContext — scope-determined statement handlers
+        self.handle_if: Callable | None = None
+        self.handle_while: Callable | None = None
+        self.handle_assert: Callable | None = None
 
     def parse(self, source: str | pyast.Node) -> Any:
         if isinstance(source, str):
@@ -190,7 +198,27 @@ class IRParser:
                 r = self._try_dispatch(dec_val, node)
                 if r is not None:
                     return r
+            # Bare def (no decorator matched) — use make_func if set
+            if self.make_func is not None:
+                return self._parse_bare_function(node)
             raise ParseError("Function has no recognized decorator")
+
+        if isinstance(node, pyast.Class):
+            for dec in node.decorators:
+                dec_val = self.eval_expr(dec)
+                r = self._try_dispatch(dec_val, node)
+                if r is not None:
+                    return r
+            raise ParseError("Class has no recognized decorator")
+
+        if isinstance(node, pyast.For):
+            iter_val = self.eval_expr(node.rhs)
+            r = self._try_dispatch(iter_val, node)
+            if r is not None:
+                return r
+            if self.make_for is not None:
+                return self._parse_range_for(node, iter_val)
+            raise ParseError("For loop iter has no dispatch and no make_for")
 
         if isinstance(node, pyast.Assign):
             if node.rhs is not None:
@@ -198,13 +226,41 @@ class IRParser:
                 r = self._try_dispatch(rhs_val, node)
                 if r is not None:
                     return r
+                # Subscript store: A[i] = val
+                if isinstance(node.lhs, pyast.Index):
+                    return self._handle_subscript_store(node, rhs_val)
                 return self._default_assign(node, rhs_val)
             return None
+
+        if isinstance(node, pyast.With):
+            ctx_val = self.eval_expr(node.rhs)
+            r = self._try_dispatch(ctx_val, node)
+            if r is not None:
+                return r
+            raise ParseError("With context has no dispatch")
+
+        if isinstance(node, pyast.If):
+            if self.handle_if is not None:
+                return self.handle_if(self, node)
+            raise ParseError("If statement but no handle_if set")
+
+        if isinstance(node, pyast.While):
+            if self.handle_while is not None:
+                return self.handle_while(self, node)
+            raise ParseError("While statement but no handle_while set")
+
+        if isinstance(node, pyast.Assert):
+            if self.handle_assert is not None:
+                return self.handle_assert(self, node)
+            raise ParseError("Assert statement but no handle_assert set")
 
         if isinstance(node, pyast.Return):
             if node.value is not None:
                 return self.eval_expr(node.value)
             return None
+
+        if isinstance(node, pyast.ExprStmt):
+            return self.eval_expr(node.expr)
 
         raise ParseError(f"Unhandled statement: {type(node).__name__}")
 
@@ -221,6 +277,59 @@ class IRParser:
             return self.make_assign(target, rhs_val)
         self.var_table.define(name, rhs_val)
         return rhs_val
+
+    def _handle_subscript_store(self, node, rhs_val) -> Any:
+        """Handle A[i] = val."""
+        target = self.eval_expr(node.lhs.obj)
+        indices = [self.eval_expr(i) for i in node.lhs.idx]
+        if self.make_store is not None:
+            return self.make_store(target, rhs_val, indices)
+        # Fallback: use __setitem__
+        if len(indices) == 1:
+            target[indices[0]] = rhs_val
+        else:
+            target[tuple(indices)] = rhs_val
+        return None
+
+    def _parse_range_for(self, node, iter_val) -> Any:
+        """Handle for-loop with range() iterator."""
+        loop_var = self.create_var(node.lhs.name)
+        self.var_table.define(node.lhs.name, loop_var)
+        body_stmts = self.visit_body(node.body)
+        if isinstance(iter_val, range):
+            start = iter_val.start
+            end = iter_val.stop
+            step = iter_val.step
+        else:
+            raise ParseError(f"Expected range, got {type(iter_val)}")
+        return self.make_for(
+            loop_var=loop_var, start=start, end=end, step=step, body=body_stmts,
+        )
+
+    def _parse_bare_function(self, node) -> Any:
+        """Handle bare def (no decorator) using make_func callback."""
+        with self.var_table.frame():
+            params = []
+            for arg in node.args:
+                name = arg.lhs.name
+                var = self.create_var(name)
+                self.var_table.define(name, var)
+                params.append(var)
+            body_stmts = self.visit_body(node.body)
+            # Separate return from body
+            ret = None
+            stmts_only = []
+            for i, stmt in enumerate(node.body):
+                if isinstance(stmt, pyast.Return):
+                    ret = body_stmts[i]
+                else:
+                    stmts_only.append(body_stmts[i])
+            return self.make_func(
+                name=node.name.name,
+                params=params,
+                body=stmts_only,
+                ret=ret,
+            )
 
     def visit_body(self, stmts) -> list:
         results = []

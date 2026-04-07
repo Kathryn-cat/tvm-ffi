@@ -1197,6 +1197,20 @@ class TraitToyOverrideObj(TraitToyExpr):
         return lhs + rhs
 
 
+# Install operator overloading on TraitToyExpr for parser roundtrip.
+# Done here (not in class body) to avoid forward reference issues.
+TraitToyExpr.__add__ = lambda self, other: TraitToyAdd(lhs=self, rhs=other)
+TraitToyExpr.__radd__ = lambda self, other: TraitToyAdd(lhs=other, rhs=self)
+TraitToyExpr.__sub__ = lambda self, other: TraitToySub(lhs=self, rhs=other)
+TraitToyExpr.__mul__ = lambda self, other: TraitToyMul(lhs=self, rhs=other)
+TraitToyExpr.__neg__ = lambda self: TraitToyNeg(x=self)
+TraitToyExpr.__invert__ = lambda self: TraitToyInvert(x=self)
+TraitToyExpr.__lt__ = lambda self, other: TraitToyLt(lhs=self, rhs=other)
+TraitToyExpr.__le__ = lambda self, other: TraitToyLtE(lhs=self, rhs=other)
+TraitToyExpr.__gt__ = lambda self, other: TraitToyGt(lhs=self, rhs=other)
+TraitToyExpr.__ge__ = lambda self, other: TraitToyGtE(lhs=self, rhs=other)
+
+
 def ast_roundtrip(node: Any) -> str:
     """Convert a Python AST to TVM-FFI AST and render back to source.
 
