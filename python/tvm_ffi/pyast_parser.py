@@ -19,7 +19,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, Callable
 
 from tvm_ffi import pyast
 
@@ -101,11 +101,18 @@ class IRParser:
 
     Uses value-driven dispatch: evaluate an expression, let the
     returned value handle parsing via __ffi_text_parse__.
+
+    The surface object can set ``create_var`` and ``make_assign``
+    on the parser before calling ``visit_body``, so that body
+    statements are handled with dialect-specific logic.
     """
 
     def __init__(self, lang_modules: dict[str, object] | None = None):
         self.var_table = VarTable()
         self.lang_modules = lang_modules or {}
+        # Dialect callbacks — set by surface objects before visit_body
+        self.create_var: Callable = lambda name, ann=None: name
+        self.make_assign: Callable | None = None
 
     def parse(self, source: str | pyast.Node) -> Any:
         if isinstance(source, str):
@@ -191,10 +198,7 @@ class IRParser:
                 r = self._try_dispatch(rhs_val, node)
                 if r is not None:
                     return r
-                # Default: bind to var_table
-                name = node.lhs.name
-                self.var_table.define(name, rhs_val)
-                return rhs_val
+                return self._default_assign(node, rhs_val)
             return None
 
         if isinstance(node, pyast.Return):
@@ -203,6 +207,20 @@ class IRParser:
             return None
 
         raise ParseError(f"Unhandled statement: {type(node).__name__}")
+
+    def _default_assign(self, node, rhs_val) -> Any:
+        """Handle assignment when RHS has no __ffi_text_parse__.
+
+        If the surface object set ``make_assign``, use it to construct
+        a dialect-specific IR assign node. Otherwise just bind to var_table.
+        """
+        name = node.lhs.name
+        if self.make_assign is not None:
+            target = self.create_var(name)
+            self.var_table.define(name, target)
+            return self.make_assign(target, rhs_val)
+        self.var_table.define(name, rhs_val)
+        return rhs_val
 
     def visit_body(self, stmts) -> list:
         results = []

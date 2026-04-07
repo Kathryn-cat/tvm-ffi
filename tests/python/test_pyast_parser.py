@@ -18,7 +18,7 @@
 
 from __future__ import annotations
 
-from tvm_ffi import pyast, structural_equal
+from tvm_ffi import structural_equal
 from tvm_ffi.pyast import to_python
 from tvm_ffi.pyast_parser import IRParser, SurfaceObject
 from tvm_ffi.testing.testing import (
@@ -31,40 +31,37 @@ from tvm_ffi.testing.testing import (
 class _PrimFuncSurface(SurfaceObject):
     """Surface object for @prim_func decorator.
 
-    This is an L2 surface object: it has dialect-specific knowledge
-    about what body statements mean (assignments produce TraitToyAssign).
+    L2 surface object: sets dialect callbacks on the parser, then
+    delegates body parsing to parser.visit_body() recursively.
     """
 
     def parse_function(self, parser, node):
         with parser.var_table.frame():
-            # Parse params
-            params = []
-            for arg in node.args:
-                name = arg.lhs.name
-                var = TraitToyVar(name=name)
-                parser.var_table.define(name, var)
-                params.append(var)
+            # Set dialect callbacks so visit_body handles stmts correctly
+            old_create_var = parser.create_var
+            old_make_assign = parser.make_assign
+            parser.create_var = lambda name, ann=None: TraitToyVar(name=name)
+            parser.make_assign = lambda target, value: TraitToyAssign(target=target, value=value)
+            try:
+                # Parse params
+                params = []
+                for arg in node.args:
+                    name = arg.lhs.name
+                    var = parser.create_var(name)
+                    parser.var_table.define(name, var)
+                    params.append(var)
 
-            # Parse body — assignments produce TraitToyAssign
-            body_stmts = []
-            for stmt in node.body:
-                if isinstance(stmt, pyast.Assign) and stmt.rhs is not None:
-                    target = TraitToyVar(name=stmt.lhs.name)
-                    value = parser.eval_expr(stmt.rhs)
-                    parser.var_table.define(stmt.lhs.name, target)
-                    body_stmts.append(
-                        TraitToyAssign(target=target, value=value)
-                    )
-                else:
-                    result = parser.visit_stmt(stmt)
-                    if result is not None:
-                        body_stmts.append(result)
+                # Parse body — recursively via parser.visit_body
+                body_stmts = parser.visit_body(node.body)
 
-            return TraitToyDecoratedFunc(
-                name=node.name.name,
-                params=params,
-                body=body_stmts,
-            )
+                return TraitToyDecoratedFunc(
+                    name=node.name.name,
+                    params=params,
+                    body=body_stmts,
+                )
+            finally:
+                parser.create_var = old_create_var
+                parser.make_assign = old_make_assign
 
 
 def test_roundtrip_decorated_func():
@@ -86,4 +83,36 @@ def test_roundtrip_decorated_func():
     f2 = parser.parse(text)
 
     # Compare
+    assert structural_equal(f, f2)
+
+
+def test_roundtrip_decorated_func_multi_stmt():
+    """@prim_func def kernel(a, b): x = a; y = b; z = x"""
+    a = TraitToyVar(name="a")
+    b = TraitToyVar(name="b")
+    x = TraitToyVar(name="x")
+    y = TraitToyVar(name="y")
+    z = TraitToyVar(name="z")
+    f = TraitToyDecoratedFunc(
+        name="kernel",
+        params=[a, b],
+        body=[
+            TraitToyAssign(target=x, value=a),
+            TraitToyAssign(target=y, value=b),
+            TraitToyAssign(target=z, value=x),
+        ],
+    )
+
+    text = to_python(f)
+    assert "@prim_func" in text
+    assert "x = a" in text
+    assert "y = b" in text
+    assert "z = x" in text
+
+    parser = IRParser(lang_modules={"prim_func": _PrimFuncSurface()})
+    f2 = parser.parse(text)
+    import pdb
+
+    pdb.set_trace()
+
     assert structural_equal(f, f2)
