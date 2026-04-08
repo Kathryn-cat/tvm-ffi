@@ -419,6 +419,30 @@ def _apply_binary_op(kind: int, lhs, rhs):
         K.RShift: lambda a, b: a >> b,
     }
     if kind in ops:
+        # If one side is a plain Python int/float and the other has dtype
+        # (e.g. PrimExpr), convert the plain value to match. This prevents
+        # Python reflected operators from flipping operand order
+        # (e.g. int.__lt__ unknown → PrimExpr.__gt__ which flips LT→GT).
+        if isinstance(lhs, (int, float)) and hasattr(rhs, "dtype"):
+            try:
+                import tvm.tirx
+
+                if isinstance(lhs, float):
+                    lhs = tvm.tirx.FloatImm(str(rhs.dtype), lhs)
+                else:
+                    lhs = tvm.tirx.IntImm(str(rhs.dtype), lhs)
+            except Exception:
+                pass
+        elif isinstance(rhs, (int, float)) and hasattr(lhs, "dtype"):
+            try:
+                import tvm.tirx
+
+                if isinstance(rhs, float):
+                    rhs = tvm.tirx.FloatImm(str(lhs.dtype), rhs)
+                else:
+                    rhs = tvm.tirx.IntImm(str(lhs.dtype), rhs)
+            except Exception:
+                pass
         return ops[kind](lhs, rhs)
     # and / or cannot use Python operators on IR values
     # Try calling _logical_op_handler if set
