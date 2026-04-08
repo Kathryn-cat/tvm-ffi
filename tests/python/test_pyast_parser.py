@@ -106,9 +106,7 @@ def _save_and_set_dialect(parser):
         parser.handle_assert,
     )
     parser.create_var = lambda name, ann=None: TraitToyVar(name=name)
-    parser.make_assign = lambda target, value: TraitToyAssign(
-        target=target, value=value,
-    )
+    parser.make_assign = lambda p, node, rhs_val: _toy_make_assign(p, node, rhs_val)
     parser.make_for = _make_for
     parser.make_store = lambda target, value, indices: TraitToyStore(
         buf=target, val=value, indices=indices,
@@ -126,6 +124,12 @@ def _restore_dialect(parser, old):
         parser.make_store, parser.handle_if, parser.handle_while,
         parser.handle_assert,
     ) = old
+
+
+def _toy_make_assign(parser, node, rhs_val):
+    target = TraitToyVar(name=node.lhs.name)
+    parser.var_table.define(node.lhs.name, target)
+    return TraitToyAssign(target=target, value=rhs_val)
 
 
 def _make_func(name, params, body, ret):

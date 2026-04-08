@@ -126,6 +126,7 @@ class IRParser:
         self.handle_if: Callable | None = None
         self.handle_while: Callable | None = None
         self.handle_assert: Callable | None = None
+        self.handle_return: Callable | None = None
 
     def parse(self, source: str | pyast.Node) -> Any:
         if isinstance(source, str):
@@ -175,10 +176,10 @@ class IRParser:
             return base[tuple(indices)]
 
         if isinstance(node, pyast.Tuple):
-            return tuple(self.eval_expr(e) for e in node.elements)
+            return tuple(self.eval_expr(e) for e in node.values)
 
         if isinstance(node, pyast.List):
-            return [self.eval_expr(e) for e in node.elements]
+            return [self.eval_expr(e) for e in node.values]
 
         raise ParseError(f"Cannot evaluate {type(node).__name__}")
 
@@ -217,6 +218,10 @@ class IRParser:
             raise ParseError("Class has no recognized decorator")
 
         if isinstance(node, pyast.For):
+            # Check if iter is range() call — handle specially to avoid
+            # calling builtins.range with IR values
+            if self.make_for is not None and self._is_range_call(node.rhs):
+                return self._parse_range_for_from_ast(node)
             iter_val = self.eval_expr(node.rhs)
             r = self._try_dispatch(iter_val, node)
             if r is not None:
@@ -260,6 +265,8 @@ class IRParser:
             raise ParseError("Assert statement but no handle_assert set")
 
         if isinstance(node, pyast.Return):
+            if self.handle_return is not None:
+                return self.handle_return(self, node)
             if node.value is not None:
                 return self.eval_expr(node.value)
             return None
@@ -274,12 +281,12 @@ class IRParser:
 
         If the surface object set ``make_assign``, use it to construct
         a dialect-specific IR assign node. Otherwise just bind to var_table.
+        ``make_assign`` receives ``(parser, node, rhs_val)`` so it can
+        access the full AST node and parser state.
         """
-        name = node.lhs.name
         if self.make_assign is not None:
-            target = self.create_var(name)
-            self.var_table.define(name, target)
-            return self.make_assign(target, rhs_val)
+            return self.make_assign(self, node, rhs_val)
+        name = node.lhs.name
         self.var_table.define(name, rhs_val)
         return rhs_val
 
@@ -295,6 +302,33 @@ class IRParser:
         else:
             target[tuple(indices)] = rhs_val
         return None
+
+    def _is_range_call(self, node) -> bool:
+        """Check if node is Call(Id("range"), ...)."""
+        return (
+            isinstance(node, pyast.Call)
+            and isinstance(node.callee, pyast.Id)
+            and node.callee.name == "range"
+        )
+
+    def _parse_range_for_from_ast(self, node) -> Any:
+        """Handle for-loop with range() by evaluating args individually."""
+        call = node.rhs  # Call(Id("range"), args)
+        args = [self.eval_expr(a) for a in call.args]
+        if len(args) == 1:
+            start, end, step = 0, args[0], 1
+        elif len(args) == 2:
+            start, end, step = args[0], args[1], 1
+        elif len(args) == 3:
+            start, end, step = args[0], args[1], args[2]
+        else:
+            raise ParseError(f"range() expects 1-3 args, got {len(args)}")
+        loop_var = self.create_var(node.lhs.name)
+        self.var_table.define(node.lhs.name, loop_var)
+        body_stmts = self.visit_body(node.body)
+        return self.make_for(
+            loop_var=loop_var, start=start, end=end, step=step, body=body_stmts,
+        )
 
     def _parse_range_for(self, node, iter_val) -> Any:
         """Handle for-loop with range() iterator."""
