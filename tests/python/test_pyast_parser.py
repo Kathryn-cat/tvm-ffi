@@ -136,7 +136,10 @@ def _make_func(name, params, body, ret):
     return TraitToyFuncNode(name=name, params=params, body=body, ret=ret)
 
 
-def _make_for(loop_var, start, end, step, body):
+def _make_for(parser, var_name, start, end, step, body_node):
+    loop_var = TraitToyVar(name=var_name)
+    parser.var_table.define(var_name, loop_var)
+    body = parser.visit_body(body_node)
     if start == 0 and step == 1:
         return TraitToyForNode(loop_var=loop_var, extent=end, body=body)
     return TraitToyForRangeNode(

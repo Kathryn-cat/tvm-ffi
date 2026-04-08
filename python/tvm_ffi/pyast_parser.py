@@ -323,27 +323,23 @@ class IRParser:
             start, end, step = args[0], args[1], args[2]
         else:
             raise ParseError(f"range() expects 1-3 args, got {len(args)}")
-        loop_var = self.create_var(node.lhs.name)
-        self.var_table.define(node.lhs.name, loop_var)
-        body_stmts = self.visit_body(node.body)
+        # Pass parser so make_for can create loop var with correct dtype
+        # and define it in var_table
         return self.make_for(
-            loop_var=loop_var, start=start, end=end, step=step, body=body_stmts,
+            parser=self, var_name=node.lhs.name,
+            start=start, end=end, step=step,
+            body_node=node.body,
         )
 
     def _parse_range_for(self, node, iter_val) -> Any:
-        """Handle for-loop with range() iterator."""
-        loop_var = self.create_var(node.lhs.name)
-        self.var_table.define(node.lhs.name, loop_var)
-        body_stmts = self.visit_body(node.body)
+        """Handle for-loop with Python range object (plain int args)."""
         if isinstance(iter_val, range):
-            start = iter_val.start
-            end = iter_val.stop
-            step = iter_val.step
-        else:
-            raise ParseError(f"Expected range, got {type(iter_val)}")
-        return self.make_for(
-            loop_var=loop_var, start=start, end=end, step=step, body=body_stmts,
-        )
+            return self.make_for(
+                parser=self, var_name=node.lhs.name,
+                start=iter_val.start, end=iter_val.stop,
+                step=iter_val.step, body_node=node.body,
+            )
+        raise ParseError(f"Expected range, got {type(iter_val)}")
 
     def _parse_bare_function(self, node) -> Any:
         """Handle bare def (no decorator) using make_func callback."""
