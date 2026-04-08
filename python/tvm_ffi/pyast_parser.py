@@ -175,11 +175,23 @@ class IRParser:
                 return base[indices[0]]
             return base[tuple(indices)]
 
+        if isinstance(node, pyast.Slice):
+            start = self.eval_expr(node.start) if node.start is not None else None
+            stop = self.eval_expr(node.stop) if node.stop is not None else None
+            step = self.eval_expr(node.step) if node.step is not None else None
+            return slice(start, stop, step)
+
         if isinstance(node, pyast.Tuple):
             return tuple(self.eval_expr(e) for e in node.values)
 
         if isinstance(node, pyast.List):
             return [self.eval_expr(e) for e in node.values]
+
+        if isinstance(node, pyast.Dict):
+            return {
+                self.eval_expr(k): self.eval_expr(v)
+                for k, v in zip(node.keys, node.values)
+            }
 
         raise ParseError(f"Cannot evaluate {type(node).__name__}")
 
@@ -400,10 +412,42 @@ def _apply_binary_op(kind: int, lhs, rhs):
         K.GtE: lambda a, b: a >= b,
         K.Eq: lambda a, b: a == b,
         K.NotEq: lambda a, b: a != b,
+        K.BitAnd: lambda a, b: a & b,
+        K.BitOr: lambda a, b: a | b,
+        K.BitXor: lambda a, b: a ^ b,
+        K.LShift: lambda a, b: a << b,
+        K.RShift: lambda a, b: a >> b,
     }
     if kind in ops:
         return ops[kind](lhs, rhs)
+    # and / or cannot use Python operators on IR values
+    # Try calling _logical_op_handler if set
+    if kind == K.And:
+        return _logical_and(lhs, rhs)
+    if kind == K.Or:
+        return _logical_or(lhs, rhs)
     raise ParseError(f"Unknown binary op kind: {kind}")
+
+
+def _logical_and(a, b):
+    """Handle `and` for both Python bools and IR values."""
+    try:
+        return a and b
+    except Exception:
+        pass
+    # IR values: use tvm.tirx.And
+    import tvm.tirx
+    return tvm.tirx.And(a, b)
+
+
+def _logical_or(a, b):
+    """Handle `or` for both Python bools and IR values."""
+    try:
+        return a or b
+    except Exception:
+        pass
+    import tvm.tirx
+    return tvm.tirx.Or(a, b)
 
 
 def _apply_unary_op(kind: int, operand):
@@ -411,8 +455,15 @@ def _apply_unary_op(kind: int, operand):
     ops = {
         K.USub: lambda a: -a,
         K.Invert: lambda a: ~a,
-        K.Not: lambda a: not a,
     }
     if kind in ops:
         return ops[kind](operand)
+    if kind == K.Not:
+        if isinstance(operand, bool):
+            return not operand
+        try:
+            import tvm.tirx
+            return tvm.tirx.Not(operand)
+        except Exception:
+            return not operand
     raise ParseError(f"Unknown unary op kind: {kind}")
