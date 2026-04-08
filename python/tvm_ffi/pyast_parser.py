@@ -42,6 +42,8 @@ class SurfaceObject:
     def __ffi_text_parse__(self, parser: IRParser, node: pyast.Node) -> Any:
         if isinstance(node, pyast.Function):
             return self.parse_function(parser, node)
+        if isinstance(node, pyast.Class):
+            return self.parse_class(parser, node)
         if isinstance(node, pyast.For):
             return self.parse_for(parser, node)
         if isinstance(node, pyast.With):
@@ -61,6 +63,9 @@ class SurfaceObject:
 
     def parse_with(self, parser, node):
         raise ParseError(f"{type(self).__name__}: parse_with not implemented")
+
+    def parse_class(self, parser, node):
+        raise ParseError(f"{type(self).__name__}: parse_class not implemented")
 
     def parse_assign(self, parser, node):
         raise ParseError(f"{type(self).__name__}: parse_assign not implemented")
