@@ -157,7 +157,18 @@ class IRParser:
             kwargs = {}
             for k, v in zip(node.kwargs_keys, node.kwargs_values):
                 kwargs[str(k)] = self.eval_expr(v)
-            return callee(*args, **kwargs)
+            try:
+                return callee(*args, **kwargs)
+            except Exception:
+                # Fallback: if callee is a GlobalVar without struct_info,
+                # construct tvm.tirx.Call directly (bypasses struct_info check)
+                try:
+                    import tvm.tirx
+                    if isinstance(callee, tvm.ir.GlobalVar):
+                        return tvm.tirx.Call("", callee, list(args))
+                except Exception:
+                    pass
+                raise
 
         if isinstance(node, pyast.Operation):
             operands = node.operands
