@@ -178,6 +178,12 @@ class IRParser:
                 return _apply_binary_op(node.op, lhs, rhs)
             if len(operands) == 1:
                 return _apply_unary_op(node.op, self.eval_expr(operands[0]))
+            if len(operands) > 2:
+                # N-ary op (e.g. `a or b or c`) — left-fold
+                result = self.eval_expr(operands[0])
+                for i in range(1, len(operands)):
+                    result = _apply_binary_op(node.op, result, self.eval_expr(operands[i]))
+                return result
 
         if isinstance(node, pyast.Index):
             base = self.eval_expr(node.obj)
@@ -466,21 +472,17 @@ def _apply_binary_op(kind: int, lhs, rhs):
 
 def _logical_and(a, b):
     """Handle `and` for both Python bools and IR values."""
-    try:
+    # Only use Python `and` for plain Python types; IR objects have unreliable __bool__
+    if isinstance(a, (bool, int, float, str, type(None))) and isinstance(b, (bool, int, float, str, type(None))):
         return a and b
-    except Exception:
-        pass
-    # IR values: use tvm.tirx.And
     import tvm.tirx
     return tvm.tirx.And(a, b)
 
 
 def _logical_or(a, b):
     """Handle `or` for both Python bools and IR values."""
-    try:
+    if isinstance(a, (bool, int, float, str, type(None))) and isinstance(b, (bool, int, float, str, type(None))):
         return a or b
-    except Exception:
-        pass
     import tvm.tirx
     return tvm.tirx.Or(a, b)
 
@@ -494,11 +496,13 @@ def _apply_unary_op(kind: int, operand):
     if kind in ops:
         return ops[kind](operand)
     if kind == K.Not:
-        if isinstance(operand, bool):
+        if isinstance(operand, (bool, int, float)):
             return not operand
         try:
             import tvm.tirx
             return tvm.tirx.Not(operand)
         except Exception:
             return not operand
+    if kind == K.Parens:
+        return operand  # explicit parenthesization — just unwrap
     raise ParseError(f"Unknown unary op kind: {kind}")
