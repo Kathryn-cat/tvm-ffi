@@ -45,13 +45,14 @@ if TYPE_CHECKING:
     from collections.abc import MutableMapping, MutableSequence
     from tvm_ffi import Object
     from tvm_ffi.access_path import AccessPath
-    from typing import Any, Callable
+    from typing import Any, Callable, ClassVar
 # isort: on
 # fmt: on
 # tvm-ffi-stubgen(end)
 
 import contextlib
-from collections.abc import Generator, Sequence
+import sys
+from collections.abc import Callable, Generator, Iterator, Sequence
 from typing import Any, TypeVar
 
 from tvm_ffi import Object
@@ -2140,10 +2141,1115 @@ def to_python(obj: Any, cfg: PrinterConfig | None = None) -> str:
     return StmtBlock(frame.stmts).to_python(cfg)
 
 
+#: Default set of field names hidden by :func:`dump_ast`.
+#:
+#: These are source-location and commentary fields inherited from
+#: :class:`Node` / :class:`Stmt` that are structurally uninteresting when
+#: debugging parser input shape. Pass a custom ``skip_fields`` to surface
+#: them.
+_DUMP_AST_DEFAULT_SKIP: frozenset[str] = frozenset(
+    {
+        "source_paths",
+        "lineno",
+        "col_offset",
+        "end_lineno",
+        "end_col_offset",
+        "comment",
+    }
+)
+
+
+def dump_ast(  # noqa: PLR0912
+    node: Any,
+    *,
+    indent: int = 0,
+    max_depth: int = 16,
+    file: Any = None,
+    skip_fields: frozenset[str] = _DUMP_AST_DEFAULT_SKIP,
+) -> None:
+    """Recursively print the structure of a pyast :class:`Node` tree.
+
+    Counterpart to ``_dump_ir_node`` in ``step1_all_loops_trace.py`` tuned
+    for tvm-ffi :class:`Node` instances. Uses :func:`iter_fields` (the
+    FFI-reflection-backed field iterator) instead of ad-hoc ``dir()``
+    scraping, so exactly the declared fields are shown — in registration
+    order, inherited fields included.
+
+    Intended for parser debugging: given source text or a :class:`Node`,
+    print the structural shape the :class:`IRParser` is about to consume.
+
+    Output format (example, for ``def func(a: T.int32): b = a + 1``)::
+
+        Function
+          .name =
+            Id
+              .name = 'func'
+          .args = [1]
+              Assign
+                .lhs =
+                  Id
+                    .name = 'a'
+                .annotation =
+                  Attr
+                    .obj =
+                      Id
+                        .name = 'T'
+                    .name = 'int32'
+                .aug_op = 0
+          .body = [1]
+              Assign
+                .lhs =
+                  Id
+                    .name = 'b'
+                .rhs =
+                  Operation
+                    .kind = 0
+                    .operands = [2] ...
+                .aug_op = 0
+
+    Parameters
+    ----------
+    node
+        The pyast :class:`Node` (or a primitive, list, ``None``) to dump.
+        Accepts raw Python source strings via the caller's :func:`from_py`
+        preprocessing — not done here to keep the function pure.
+    indent
+        Current indentation level (used for recursive calls). Callers
+        typically leave this at ``0``.
+    max_depth
+        Stop recursing past this depth; deeper nodes are rendered as
+        ``ClassName ...``. Default ``16`` is deep enough for realistic
+        parser inputs while bounding pathological cases.
+    file
+        Stream to write to. Defaults to :data:`sys.stdout`.
+    skip_fields
+        Field names to omit from the output. Default hides Node's source-
+        location metadata (``source_paths``, ``lineno``, ``col_offset``,
+        ``end_lineno``, ``end_col_offset``) and ``comment``. Pass
+        ``frozenset()`` to surface everything.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        from tvm_ffi import pyast
+
+        src = pyast.from_py("def f(a: int): return a + 1")
+        pyast.dump_ast(src)
+
+    """
+    import sys  # noqa: PLC0415
+
+    if file is None:
+        file = sys.stdout
+    pad = "  " * indent
+
+    # ---- None and scalars ----------------------------------------------------
+    if node is None:
+        print(f"{pad}None", file=file)
+        return
+    if isinstance(node, (int, float, bool, str)):
+        print(f"{pad}{type(node).__name__}({node!r})", file=file)
+        return
+
+    # ---- Depth guard ---------------------------------------------------------
+    if indent >= max_depth:
+        print(f"{pad}{type(node).__name__} ...", file=file)
+        return
+
+    # ---- List / tuple-like top-level containers ------------------------------
+    if isinstance(node, (list, tuple)):
+        items = list(node)
+        if not items:
+            print(f"{pad}[]", file=file)
+            return
+        print(f"{pad}[{len(items)}]", file=file)
+        for item in items:
+            dump_ast(
+                item,
+                indent=indent + 1,
+                max_depth=max_depth,
+                file=file,
+                skip_fields=skip_fields,
+            )
+        return
+
+    # ---- Node (FFI-reflected object) -----------------------------------------
+    if isinstance(node, Node):
+        print(f"{pad}{type(node).__name__}", file=file)
+        for fname, value in iter_fields(node):
+            if fname in skip_fields:
+                continue
+            if value is None:
+                continue
+            if isinstance(value, (int, float, bool, str)):
+                print(f"{pad}  .{fname} = {value!r}", file=file)
+                continue
+            if isinstance(value, Node):
+                print(f"{pad}  .{fname} =", file=file)
+                dump_ast(
+                    value,
+                    indent=indent + 2,
+                    max_depth=max_depth,
+                    file=file,
+                    skip_fields=skip_fields,
+                )
+                continue
+            try:
+                items = list(value)
+            except TypeError:
+                print(f"{pad}  .{fname} = {value!r}", file=file)
+                continue
+            if not items:
+                print(f"{pad}  .{fname} = []", file=file)
+            else:
+                print(f"{pad}  .{fname} = [{len(items)}]", file=file)
+                for item in items:
+                    dump_ast(
+                        item,
+                        indent=indent + 2,
+                        max_depth=max_depth,
+                        file=file,
+                        skip_fields=skip_fields,
+                    )
+        return
+
+    # ---- Fallback: unknown object type ---------------------------------------
+    print(f"{pad}{type(node).__name__}({node!r})", file=file)
+
+
+# ============================================================================
+# Parser frames — cross-dialect dispatch stack
+# ============================================================================
+
+
+class Frame:
+    """Generic parser frame — dispatch contribution + IR-construction state."""
+
+    __slots__ = ("dialects", "__dict__")
+
+    def __init__(self, *, dialects: Sequence[Any] | None = None, **data: Any) -> None:
+        self.dialects: list[Any] = list(dialects) if dialects else []
+        if data:
+            self.__dict__.update(data)
+
+
+class FuncFrame(Frame):
+    """Marker frame for a function-definition body (``def f(...): ...``)."""
+
+
+class ForFrame(Frame):
+    """Typed for-loop frame — doubles as:
+
+    1. The runtime value returned by ``T.serial(0, n)`` / ``T.parallel(...)`` /
+       ... iter factories before :meth:`IRParser.visit_for` runs.
+    2. The marker frame pushed while the loop body parses — cross-cutting
+       code queries ``isinstance(f, ForFrame)`` + ``f.kind`` to detect
+       "am I inside a loop of kind K?" regardless of which dialect owns
+       the loop.
+
+    Post ``design_docs/parser_for_handler_refactor.md``: this class
+    replaces the per-dialect ``_IterHolder`` / ``_ScfRange`` dataclasses
+    and the ``__ffi_for_handler__`` protocol. :meth:`IRParser.visit_for`
+    dispatches on ``isinstance(iter_val, ForFrame)`` directly and
+    builds ``for_cls(**frame_kwargs)``.
+    """
+
+    __slots__ = ()
+
+    def __init__(
+        self,
+        *,
+        for_cls: "type | None" = None,
+        kind: str = "serial",
+        start: Any = None,
+        end: Any = None,
+        step: Any = 1,
+        annotations: Any = None,
+        loop_var_ty: Any = None,
+        dialects: Sequence[Any] | None = None,
+        **data: Any,
+    ) -> None:
+        super().__init__(dialects=dialects)
+        self.for_cls = for_cls
+        self.kind = kind
+        self.start = start
+        self.end = end
+        self.step = step
+        self.annotations = annotations
+        self.loop_var_ty = loop_var_ty
+        if data:
+            self.__dict__.update(data)
+
+
+class IfFrame(Frame):
+    """Marker frame for an if/else branch body."""
+
+
+class WhileFrame(Frame):
+    """Marker frame for a while-loop body."""
+
+
+class WithFrame(Frame):
+    """Marker frame for a with-block body. Pushed by every dialect's
+    ``__ffi_with_handler__``."""
+
+
+# ============================================================================
+# Parse-hook factories — build frame-mutating callables for
+# ``__ffi_parse_hooks__`` declarations. See design_docs/parser_frame_hooks.md.
+# ============================================================================
+
+
+def frame_setter(
+    field: str,
+    frame_cls: type[Frame] = FuncFrame,
+) -> Callable[..., None]:
+    """Return a parse hook that overwrites ``frame.<field>`` with its
+    single positional argument.
+
+    Used for prologue calls like ``T.func_ret(i32)`` that set a scalar
+    property on the enclosing function. Raises :class:`TypeError` at
+    parse time if the hook receives anything other than exactly one
+    positional arg.
+    """
+
+    def _hook(parser: "IRParser", *args: Any, **kwargs: Any) -> None:
+        if kwargs or len(args) != 1:
+            raise TypeError(
+                f"frame_setter({field!r}): expected exactly one positional "
+                f"arg, got args={args!r} kwargs={kwargs!r}",
+            )
+        frame = parser.find_frame(frame_cls, origin=f"frame_setter({field!r})")
+        setattr(frame, field, args[0])
+
+    _hook.__ffi_parse_hook__ = True  # type: ignore[attr-defined]
+    _hook.__name__ = f"_frame_setter_{field}"
+    return _hook
+
+
+def frame_merger(
+    field: str,
+    frame_cls: type[Frame] = FuncFrame,
+) -> Callable[..., None]:
+    """Return a parse hook that shallow-merges a dict arg into
+    ``frame.<field>``.
+
+    Equivalent to ``frame.<field> = {**(frame.<field> or {}), **value}``.
+    Used for prologue calls like ``T.func_attr({"noalias": True})``;
+    multiple such calls in the same body accumulate rather than
+    overwriting each other.
+    """
+
+    def _hook(parser: "IRParser", *args: Any, **kwargs: Any) -> None:
+        if kwargs or len(args) != 1:
+            raise TypeError(
+                f"frame_merger({field!r}): expected exactly one positional "
+                f"dict arg, got args={args!r} kwargs={kwargs!r}",
+            )
+        value = args[0]
+        if not isinstance(value, dict):
+            raise TypeError(
+                f"frame_merger({field!r}): expected dict arg, got "
+                f"{type(value).__name__}",
+            )
+        frame = parser.find_frame(frame_cls, origin=f"frame_merger({field!r})")
+        current = getattr(frame, field, None)
+        setattr(frame, field, {**(current or {}), **value})
+
+    _hook.__ffi_parse_hook__ = True  # type: ignore[attr-defined]
+    _hook.__name__ = f"_frame_merger_{field}"
+    return _hook
+
+
+# ============================================================================
+# IRParser — trait-driven parser (PyAST → IR objects)
+# ============================================================================
+
+
+class IRParser:
+    """Trait-driven IR parser: converts PyAST nodes into IR objects.
+
+    Counterpart to :class:`IRPrinter`, which converts IR objects into PyAST.
+    Uses the same ``__ffi_ir_traits__`` metadata to drive the parse dispatch.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        parser = IRParser()
+        ast_node = pyast.from_py(source_text)
+        ir_obj = parser.parse(ast_node)
+
+    """
+
+    def __init__(
+        self,
+        lang_modules: dict[str, Any] | None = None,
+        *,
+        var_factory: Callable[[str, Any], Any] | None = None,
+    ) -> None:
+        """Construct an :class:`IRParser`.
+
+        Parameters
+        ----------
+        lang_modules
+            Prefix → language-module registry — maps identifier strings
+            (``"T"``, ``"I"``, …) to Python objects that resolve during
+            ``eval_expr(Id("T"))``. Also becomes the initial registered
+            dialect list for frame-based dispatch.
+        var_factory
+            Optional legacy ``(name, ty) → Var`` factory, retained for
+            back-compat with tests that still wire it explicitly.
+        """
+        self._scopes: list[dict[str, Any]] = [{}]
+        self._lang_modules: dict[str, Any] = dict(lang_modules) if lang_modules else {}
+        self.var_factory = var_factory
+
+        # --- Frame-based dispatch state ---
+        self._frames: list[Frame] = []
+        self._registered_dialects: list[Any] = []
+        for mod in self._lang_modules.values():
+            if mod not in self._registered_dialects:
+                self._registered_dialects.append(mod)
+
+    # ------------------------------------------------------------------
+    # Frame-based dispatch API
+    # ------------------------------------------------------------------
+
+    def register_dialect(self, *dialects: Any) -> None:
+        """Add dialects to the parser's base registry."""
+        for d in dialects:
+            if d not in self._registered_dialects:
+                self._registered_dialects.append(d)
+
+    @contextlib.contextmanager
+    def push_frame(self, frame: Frame) -> Iterator[Frame]:
+        """Push ``frame`` onto the dispatch stack for the ``with`` block."""
+        self._frames.append(frame)
+        try:
+            yield frame
+        finally:
+            popped = self._frames.pop()
+            assert popped is frame, (
+                "IRParser frame-stack corruption: the frame popped at exit "
+                f"({type(popped).__name__}) is not the frame that was pushed "
+                f"({type(frame).__name__}). A handler probably mutated "
+                "``_frames`` without using ``push_frame``."
+            )
+
+    @contextlib.contextmanager
+    def with_dialects(self, *dialects: Any) -> Iterator[None]:
+        """Sugar: push a bare :class:`Frame` that only contributes dialects."""
+        with self.push_frame(Frame(dialects=dialects)):
+            yield
+
+    def active_dialects(self) -> Iterator[Any]:
+        """Yield dialects in dispatch order: innermost frame first, then
+        outer frames, then the base registry."""
+        seen: set[int] = set()
+        for frame in reversed(self._frames):
+            for d in frame.dialects:
+                key = id(d)
+                if key in seen:
+                    continue
+                seen.add(key)
+                yield d
+        for d in self._registered_dialects:
+            key = id(d)
+            if key in seen:
+                continue
+            seen.add(key)
+            yield d
+
+    def find_frame(
+        self,
+        frame_cls: type[Frame],
+        *,
+        origin: str | None = None,
+    ) -> Frame:
+        """Return the innermost active frame of ``frame_cls``.
+
+        Used by parse hooks that need to mutate enclosing-construct state
+        (``FuncFrame.attrs`` from ``T.func_attr({...})`` etc.). Raises
+        :class:`RuntimeError` if no such frame is on the dispatch stack —
+        the error is deliberately loud so missing / mis-ordered frames
+        show up at the site that needs them rather than silently corrupting
+        downstream IR construction.
+        """
+        for frame in reversed(self._frames):
+            if isinstance(frame, frame_cls):
+                return frame
+        origin_s = f" (needed by {origin})" if origin else ""
+        raise RuntimeError(
+            f"find_frame({frame_cls.__name__}): no ancestor frame of that "
+            f"type on the dispatch stack{origin_s}. Active frames: "
+            + ", ".join(type(f).__name__ for f in self._frames),
+        )
+
+    def _lookup_hook(self, name: str) -> Any:
+        """Find ``name`` as an attribute on the nearest active dialect."""
+        for dialect in self.active_dialects():
+            val = getattr(dialect, name, None)
+            if val is not None:
+                return val
+        return None
+
+    # ------------------------------------------------------------------
+    # Var-table
+    # ------------------------------------------------------------------
+
+    def push_scope(self) -> None:
+        """Open a new innermost scope."""
+        self._scopes.append({})
+
+    def pop_scope(self) -> None:
+        """Close the innermost scope."""
+        if len(self._scopes) <= 1:
+            raise RuntimeError(
+                "pop_scope called with only the global scope on the stack — "
+                "indicates an unbalanced push/pop pair. Prefer "
+                "IRParser.scoped_frame() to keep them paired automatically.",
+            )
+        self._scopes.pop()
+
+    @contextlib.contextmanager
+    def scoped_frame(self) -> Iterator[None]:
+        """Push a fresh scope for the duration of the ``with`` block."""
+        self.push_scope()
+        try:
+            yield
+        finally:
+            self.pop_scope()
+
+    def define(self, name: str, var: Any) -> None:
+        """Register ``name → var`` in the innermost scope."""
+        innermost = self._scopes[-1]
+        if name in innermost:
+            raise NameError(
+                f"variable {name!r} is already defined in the innermost "
+                f"scope (depth {self.scope_depth - 1}); this is usually a "
+                f"parser bug (duplicate parameter / loop var / bind). "
+                f"Call IRParser.redefine to overwrite intentionally. "
+                f"Active scope chain: {self._format_scope_chain()}",
+            )
+        innermost[name] = var
+
+    def redefine(self, name: str, var: Any) -> None:
+        """Overwrite ``name`` in the innermost scope without checking."""
+        self._scopes[-1][name] = var
+
+    def lookup(self, name: str) -> Any | None:
+        """Resolve ``name`` against the scope chain (innermost first)."""
+        for scope in reversed(self._scopes):
+            if name in scope:
+                return scope[name]
+        return None
+
+    def lookup_required(self, name: str, *, role: str = "variable") -> Any:
+        """Like :meth:`lookup` but raises :class:`NameError` on miss."""
+        val = self.lookup(name)
+        if val is None:
+            raise NameError(
+                f"{role} {name!r} is not defined; active scope chain "
+                f"(innermost first): {self._format_scope_chain()}",
+            )
+        return val
+
+    @property
+    def scope_depth(self) -> int:
+        """Total number of active scopes, including the global one."""
+        return len(self._scopes)
+
+    def _format_scope_chain(self) -> str:
+        """Render the scope chain for inclusion in error messages."""
+        parts: list[str] = []
+        n = len(self._scopes)
+        for offset, scope in enumerate(reversed(self._scopes)):
+            depth = n - 1 - offset
+            keys = ", ".join(sorted(scope.keys())) or ""
+            parts.append(f"depth {depth}: {{{keys}}}")
+        return "[" + "; ".join(parts) + "]"
+
+    # ---- Public entry point ----
+
+    def parse(self, source: str | Node) -> Any:
+        """Parse Python source text or a PyAST node into IR objects.
+
+        Parameters
+        ----------
+        source
+            Either a Python source string (passed through :func:`from_py`
+            first) or a PyAST :class:`Node` directly.
+
+        Returns
+        -------
+        Any
+            The parsed IR object(s).  For a :class:`StmtBlock` input,
+            returns a list of IR objects.
+
+        """
+        if isinstance(source, str):
+            source = from_py(source)
+            import sys
+
+            dump_ast(source, file=sys.stdout)
+        return self.visit(source)
+
+    # ---- Unified dispatch ----
+
+    def visit(self, node: Node) -> Any:
+        """Dispatch a PyAST node to its ``visit_*`` method."""
+        if isinstance(node, StmtBlock):
+            return self.visit_stmt_block(node)
+        if isinstance(node, Function):
+            return self.visit_function(node)
+        if isinstance(node, Class):
+            return self.visit_class(node)
+        if isinstance(node, Assign):
+            return self.visit_assign(node)
+        if isinstance(node, ExprStmt):
+            return self.visit_expr_stmt(node)
+        if isinstance(node, Return):
+            return self.visit_return(node)
+        if isinstance(node, Assert):
+            return self.visit_assert(node)
+        if isinstance(node, If):
+            return self.visit_if(node)
+        if isinstance(node, While):
+            return self.visit_while(node)
+        if isinstance(node, For):
+            return self.visit_for(node)
+        if isinstance(node, With):
+            return self.visit_with(node)
+        if isinstance(node, Id):
+            return self.visit_id(node)
+        raise NotImplementedError(f"visit: unhandled {type(node).__name__}")
+
+    def visit_body(self, stmts: Sequence[Stmt]) -> list[Any]:
+        """Visit a sequence of statements and return their IR objects.
+
+        A ``None`` result from ``visit`` is treated as a signal that the
+        statement was consumed by a frame-mutating parse hook (see
+        ``__ffi_parse_hook__`` — e.g. ``T.func_attr({...})`` prologue
+        calls). The ``None`` is dropped so no residue appears in the
+        constructed body.
+        """
+        out: list[Any] = []
+        for s in stmts:
+            if isinstance(s, ExprStmt) and isinstance(s.expr, Id) and s.expr.name == "pass":
+                continue
+            result = self.visit(s)
+            if result is None:
+                continue
+            out.append(result)
+        return out
+
+    def eval_expr(self, node: Expr) -> Any:
+        """Evaluate an expression to a Python value.
+
+        Resolution order for :class:`Id`:
+        1. Local scope (variables registered via :meth:`define`).
+        2. Language-module registry passed at construction.
+        3. :meth:`resolve_module` hook for subclass extension.
+        """
+        if isinstance(node, Literal):
+            return node.value
+        if isinstance(node, Id):
+            var = self.lookup(node.name)
+            if var is not None:
+                return var
+            if node.name in self._lang_modules:
+                return self._lang_modules[node.name]
+            return self.resolve_module(node.name)
+        if isinstance(node, Attr):
+            qualified = self._maybe_qualified_class(node)
+            if qualified is not None:
+                return qualified
+            return getattr(self.eval_expr(node.obj), node.name)
+        if isinstance(node, Operation):
+            return self.visit_operation(node)
+        if isinstance(node, Call):
+            return self.visit_call(node)
+        if isinstance(node, Index):
+            return self.visit_index(node)
+        if isinstance(node, List):
+            return [self.eval_expr(v) for v in node.values]
+        if isinstance(node, Tuple):
+            return tuple(self.eval_expr(v) for v in node.values)
+        if isinstance(node, Dict):
+            return {
+                self.eval_expr(k): self.eval_expr(v)
+                for k, v in zip(node.keys, node.values)
+            }
+        raise NotImplementedError(f"eval_expr: unhandled {type(node).__name__}")
+
+    def resolve_module(self, name: str) -> Any:
+        """Subclass hook for resolving identifiers not in scope or lang modules."""
+        raise NameError(f"Unknown identifier: {name!r}")
+
+    def _maybe_qualified_class(self, node: "Attr") -> Any:
+        """Attempt to resolve an ``Attr`` chain as a ``@py_class`` type key.
+
+        The default printer emits leaf IR classes (Tier-3) as their
+        fully-qualified type key — e.g. ``mini.tir.Cast(target=...)``.
+        When the leftmost :class:`Id` isn't a registered language
+        module, flatten the ``Attr`` chain into a dotted string and
+        look it up in the type-key registry. Returns the class on hit,
+        :data:`None` on miss (callers should fall back to the normal
+        attribute walk).
+        """
+        parts: list[str] = []
+        current: Any = node
+        while isinstance(current, Attr):
+            parts.append(current.name)
+            current = current.obj
+        if not isinstance(current, Id):
+            return None
+        root = current.name
+        # If the leftmost Id is a registered lang module or bound
+        # variable, use the normal attribute walk — the type-key
+        # fallback is a last resort.
+        if self.lookup(root) is not None or root in self._lang_modules:
+            return None
+        parts.append(root)
+        parts.reverse()
+        qualified = ".".join(parts)
+        try:
+            from tvm_ffi import core as _core  # noqa: PLC0415
+
+            info = _core._lookup_or_register_type_info_from_type_key(qualified)
+        except Exception:  # noqa: BLE001
+            return None
+        cls = getattr(info, "type_cls", None)
+        if cls is None or cls is Object:
+            # ``type_cls`` defaults to :class:`Object` for type keys
+            # that exist in the FFI-level registry but haven't been
+            # bound to a Python class — treat that as a miss.
+            return None
+        return cls
+
+    # ---- Expression visitors ----
+
+    def visit_id(self, node: Id) -> Any:
+        """Look up a variable by name in the current scope."""
+        var = self.lookup(node.name)
+        if var is not None:
+            return var
+        raise ValueError(f"Undefined variable: {node.name!r}")
+
+    def visit_index(self, node: Index) -> Any:
+        """Evaluate a subscript expression ``obj[indices]``.
+
+        Dispatch order:
+        1. If a language module exposes ``load``, call
+           ``load(parser, obj, indices)``.
+        2. Otherwise invoke ``obj[indices]`` — IR classes like ``Buffer``
+           typically define ``__getitem__`` to build a trait-driven Load.
+        """
+        obj = self.eval_expr(node.obj)
+        indices = [self.eval_expr(i) for i in node.idx]
+        load = self._lookup_hook("load")
+        if load is not None:
+            return load(self, obj, indices)
+        if len(indices) == 1:
+            return obj[indices[0]]
+        return obj[tuple(indices)]
+
+    def visit_call(self, node: Call) -> Any:
+        """Evaluate a call expression by invoking the resolved callee.
+
+        Dispatch is split into three paths:
+
+        1. **Parse-aware dispatcher** — if ``callee.__ffi_parse_aware__``
+           is ``True``, the callee was registered by
+           :func:`tvm_ffi.parse_dispatch.register_parser` and expects
+           ``(parser, node)``. Handles Tier 1 / 2 / 3 internally.
+        2. **IR class (``@py_class``)** — if ``callee`` is a registered
+           IR class, look up its dispatcher via
+           :func:`tvm_ffi.parse_dispatch.lookup_parser` in the owning
+           language module's ``__ffi_parsers__`` registry and invoke it
+           as a parse-aware dispatcher. If no dispatcher is registered,
+           fall back to value-eager construction (with primitive
+           wrapping via the active dialect's
+           ``__ffi_default_{int,float,bool}_ty__`` hooks).
+        3. **Plain callable** — for every other callable (``range``,
+           ``T.float32`` factory, user helper, etc.) evaluate args /
+           kwargs eagerly and invoke the callee with those values.
+        """
+        callee = self.eval_expr(node.callee)
+
+        # Path 1 — the callee is a parse-aware dispatcher.
+        if getattr(callee, "__ffi_parse_aware__", False):
+            return callee(self, node)
+
+        # Path 1b — the callee is a frame-mutating parse hook (e.g. a
+        # ``T.func_attr({...})`` prologue). The hook receives evaluated
+        # args / kwargs, mutates the enclosing frame, and returns None.
+        # ``visit_body`` filters those Nones so the hook leaves no
+        # body-residue. See design_docs/parser_frame_hooks.md.
+        if getattr(callee, "__ffi_parse_hook__", False):
+            args = [self.eval_expr(a) for a in node.args]
+            kwargs = {
+                k: self.eval_expr(v)
+                for k, v in zip(node.kwargs_keys, node.kwargs_values)
+            }
+            return callee(self, *args, **kwargs)
+
+        # Path 2 — the callee is an IR class. Look for a registered
+        # dispatcher in the owning language module. If found, run the
+        # three-tier dispatch; otherwise fall back to value-eager
+        # construction.
+        if isinstance(callee, type) and hasattr(callee, "__tvm_ffi_type_info__"):
+            from tvm_ffi.parse_dispatch import lookup_parser  # noqa: PLC0415
+
+            owner = sys.modules.get(callee.__module__)
+            if owner is not None:
+                dispatcher = lookup_parser(owner, callee.__name__)
+                if dispatcher is not None:
+                    return dispatcher(self, node)
+
+            args = [self.eval_expr(a) for a in node.args]
+            kwargs = {
+                k: self.eval_expr(v)
+                for k, v in zip(node.kwargs_keys, node.kwargs_values)
+            }
+            if hasattr(callee, "__ffi_ir_traits__"):
+                args = [self._wrap_primitive_ast(a) for a in args]
+                kwargs = {
+                    k: self._wrap_primitive_ast(v) for k, v in kwargs.items()
+                }
+            return callee(*args, **kwargs)
+
+        # Path 3 — plain callable, value-eager.
+        args = [self.eval_expr(a) for a in node.args]
+        kwargs = {
+            k: self.eval_expr(v) for k, v in zip(node.kwargs_keys, node.kwargs_values)
+        }
+        return callee(*args, **kwargs)
+
+    def _wrap_primitive_ast(self, value: Any) -> Any:
+        """Lift raw Python primitives to dialect IR via active-dialect
+        ``__ffi_default_{int,float,bool}_ty__`` hooks. Objects pass through."""
+        if value is None or not isinstance(value, (bool, int, float)):
+            return value
+        if isinstance(value, bool):
+            hook_name = "__ffi_default_bool_ty__"
+        elif isinstance(value, int):
+            hook_name = "__ffi_default_int_ty__"
+        else:
+            hook_name = "__ffi_default_float_ty__"
+        for dialect in self.active_dialects():
+            handle = getattr(dialect, hook_name, None)
+            if handle is not None and callable(handle):
+                return handle(value)
+        return value
+
+    def visit_operation(self, node: Operation) -> Any:
+        """Dispatch a :class:`Operation` via the lang module's
+        ``__ffi_op_classes__`` map.
+
+        Each ``{OperationKind: handler}`` entry accepts either a direct
+        callable (auto-wired closures from :func:`_wire_binop` /
+        :func:`_wire_unaryop`) or a dotted-string path (user-defined
+        custom dispatchers — e.g. mini.mlir.arith's type-predicate
+        ``_op_add`` / ``_op_sub``). Callables are invoked directly;
+        strings are resolved via :meth:`eval_expr` against the
+        lang-module registry.
+        """
+        if node.op == OperationKind.Parens:
+            return self.eval_expr(node.operands[0])
+
+        # ----------------------------------------------------------------
+        # Cross-dialect operation dispatch
+        # ----------------------------------------------------------------
+
+        tried: list[str] = []
+        for dialect in self.active_dialects():
+            op_classes = getattr(dialect, "__ffi_op_classes__", None)
+            if not op_classes:
+                continue
+            ref = op_classes.get(node.op)
+            if ref is None:
+                continue
+            if callable(ref):
+                tried.append(getattr(ref, "__name__", repr(ref)))
+                parse_fn: Any = ref
+            else:
+                tried.append(str(ref))
+                parts = str(ref).split(".")
+                expr: Expr = Id(name=parts[0])
+                for p in parts[1:]:
+                    expr = Attr(obj=expr, name=p)
+                parse_fn = self.eval_expr(expr)
+            result = parse_fn(self, node)
+            if result is not None:
+                return result
+
+        if tried:
+            raise NotImplementedError(
+                f"visit_operation: none of the {len(tried)} handlers "
+                f"({', '.join(tried)}) accepted operation kind={node.op}. "
+                f"Check that at least one dialect's handler matches the "
+                f"operand types at this call site.",
+            )
+        raise NotImplementedError(
+            f"visit_operation: no dialect declares ``__ffi_op_classes__`` "
+            f"with an entry for OperationKind kind={node.op}. Register a "
+            f"``{{OperationKind.X: <callable or 'dotted.path'>, ...}}`` "
+            f"map on at least one language module to enable sugar-form "
+            f"(``a + b``) parsing.",
+        )
+
+    def visit_stmt_block(self, node: StmtBlock) -> Any:
+        return self.visit_body(node.stmts)
+
+    def visit_expr_stmt(self, node: ExprStmt) -> Any:
+        return self.eval_expr(node.expr)
+
+    # ---- Statement visitors ----
+
+    def visit_function(self, node: Function) -> Any:
+        """Parse a function definition via decorator-based registry dispatch."""
+        if not node.decorators:
+            raise ValueError(
+                f"Function {node.name.name!r} must be decorated to dispatch parser",
+            )
+        handler = self.eval_expr(node.decorators[-1])
+        if not callable(handler):
+            raise TypeError(
+                f"Decorator did not resolve to a callable parse handler: {handler!r}",
+            )
+        with self.push_frame(FuncFrame(name=node.name.name)):
+            return handler(self, node)
+
+    def visit_class(self, node: Class) -> Any:
+        """Parse a class definition via decorator-based registry dispatch."""
+        if not node.decorators:
+            raise ValueError(
+                f"Class {node.name.name!r} must be decorated to dispatch parser",
+            )
+        handler = self.eval_expr(node.decorators[-1])
+        if not callable(handler):
+            raise TypeError(
+                f"Decorator did not resolve to a callable parse handler: {handler!r}",
+            )
+        with self.push_frame(FuncFrame(name=node.name.name, is_class=True)):
+            return handler(self, node)
+
+    def visit_return(self, node: Return) -> Any:
+        """Parse a ``return <value>`` stmt."""
+        value = self.eval_expr(node.value) if node.value is not None else None
+        hook = self._lookup_hook("ret")
+        if hook is not None:
+            return hook(self, value)
+        return value
+
+    def visit_if(self, node: If) -> Any:
+        """Parse ``if / else``. Looks up ``if_stmt`` hook on language modules."""
+        cond = self.eval_expr(node.cond)
+        with self.scoped_frame(), self.push_frame(IfFrame()):
+            then_body = self.visit_body(node.then_branch)
+        else_body: list[Any] = []
+        if node.else_branch:
+            with self.scoped_frame(), self.push_frame(IfFrame()):
+                else_body = self.visit_body(node.else_branch)
+        hook = self._lookup_hook("if_stmt")
+        if hook is not None:
+            return hook(self, cond, then_body, else_body)
+        return (cond, then_body, else_body)
+
+    def visit_for(self, node: For) -> Any:
+        """Parse ``for`` loop — direct dispatch on :class:`ForFrame`.
+
+        Post ``design_docs/parser_for_handler_refactor.md``: the iter
+        factory on the dialect (``T.serial(...)`` / ``scf.range(...)``)
+        returns a :class:`ForFrame` carrying ``for_cls`` plus the loop
+        bounds; :meth:`_dispatch_for_frame` builds the IR from it.
+        Plain ``range(...)`` falls through to the first active dialect
+        that declares an ``__ffi_range_default__`` iter factory.
+        """
+        iter_val = self.eval_expr(node.rhs)
+        if isinstance(iter_val, ForFrame):
+            return self._dispatch_for_frame(iter_val, node)
+        if isinstance(iter_val, range):
+            for dialect in self.active_dialects():
+                default = getattr(dialect, "__ffi_range_default__", None)
+                if default is None:
+                    continue
+                wrapped = default(
+                    iter_val.start, iter_val.stop, step=iter_val.step,
+                )
+                if isinstance(wrapped, ForFrame):
+                    return self._dispatch_for_frame(wrapped, node)
+            raise TypeError(
+                "for-loop with bare ``range(...)`` but no active dialect "
+                "declares ``__ffi_range_default__`` (the framework needs "
+                "a default iter-kind factory to build a ForFrame from "
+                "the range).",
+            )
+        raise TypeError(
+            f"visit_for: unsupported for-iter type "
+            f"{type(iter_val).__name__}. Expected a :class:`ForFrame` "
+            "(from ``T.serial(...)`` / ``scf.range(...)`` / etc.) or a "
+            "plain Python ``range``.",
+        )
+
+    def _dispatch_for_frame(self, frame: "ForFrame", node: "For") -> Any:
+        """Build ``frame.for_cls(**kwargs)`` after parsing the loop body.
+
+        Two passes:
+
+        1. Walk the IR class's ``ForTraits``; for each ``$field:`` slot
+           translate the frame's canonical attr (``start`` / ``end`` /
+           ``step`` / ``annotations``) onto the IR-declared field name.
+        2. For non-``$field:`` slots (``$global:`` / ``$method:``),
+           look up ``__ffi_parse_inverse__[slot_name]`` on the IR
+           class (see ``design_docs/parser_for_handler_refactor.md``
+           §7) and merge the method's return-dict into the build
+           kwargs. Inverses receive a :class:`ParseContext` as their
+           first argument and may also mutate ``ctx.frame`` directly.
+        """
+        from tvm_ffi import ir_traits as _tr  # noqa: PLC0415
+        from tvm_ffi.pyast_trait_parse import (  # noqa: PLC0415
+            ParseContext,
+            _field_from_ref,
+            parse_value_def,
+            resolve_slot_inverse,
+        )
+
+        if not isinstance(node.lhs, Id):
+            raise NotImplementedError(
+                "visit_for: only ``Id`` loop targets are supported "
+                f"(got {type(node.lhs).__name__}).",
+            )
+        if frame.for_cls is None:
+            raise RuntimeError(
+                "visit_for: ForFrame has no ``for_cls`` — the iter "
+                "factory must set it (e.g. ``T.serial`` factory "
+                "produced by ``finalize_module``).",
+            )
+
+        trait = getattr(frame.for_cls, "__ffi_ir_traits__", None)
+        if not isinstance(trait, _tr.ForTraits):
+            raise TypeError(
+                f"visit_for: {frame.for_cls.__name__} has no ForTraits; "
+                "cannot build via ForFrame dispatch.",
+            )
+
+        loop_var_ty = (
+            frame.loop_var_ty
+            or self._lookup_hook("__ffi_default_int_ty__")
+        )
+        make_var = self._lookup_hook("__ffi_make_var__")
+
+        loop_var_field = (
+            _field_from_ref(trait.region.def_values) or "loop_var"
+        )
+        body_field = _field_from_ref(trait.region.body) or "body"
+
+        with self.scoped_frame(), self.push_frame(frame):
+            loop_var = parse_value_def(
+                self, node.lhs.name, annotation=None,
+                make_var=make_var, default_ty=loop_var_ty,
+            )
+            body = self.visit_body(node.body)
+
+        ctx = ParseContext(parser=self, frame=frame, ir_class=frame.for_cls)
+        build_kwargs: dict[str, Any] = {
+            loop_var_field: loop_var,
+            body_field: body,
+        }
+
+        # Canonical ForFrame attr names for each trait slot.
+        _slot_to_frame_attr = {
+            "start": "start",
+            "end": "end",
+            "step": "step",
+            "attrs": "annotations",
+        }
+        for slot_name, frame_attr in _slot_to_frame_attr.items():
+            ref = getattr(trait, slot_name, None)
+            if not isinstance(ref, str):
+                continue
+            slot_value = getattr(frame, frame_attr, None)
+            ir_field = _field_from_ref(ref)
+            if ir_field is not None:
+                build_kwargs[ir_field] = slot_value
+            else:
+                overrides = resolve_slot_inverse(ctx, slot_name, slot_value)
+                build_kwargs.update(overrides)
+
+        # ``kind`` is a regular IR field on some dialects (mini.tir.For);
+        # forward it from the frame when the class declares it.
+        declared = set(getattr(frame.for_cls, "__annotations__", {}))
+        info = getattr(frame.for_cls, "__tvm_ffi_type_info__", None)
+        if info is not None:
+            declared.update(f.name for f in info.fields)
+        if "kind" in declared and "kind" not in build_kwargs:
+            build_kwargs["kind"] = frame.kind
+
+        # Extra attrs a parse-hook wrote onto ``frame.__dict__`` during
+        # body parse (and that name declared IR fields) flow in too —
+        # useful when a trait for-class has fields beyond the five
+        # canonical slots.
+        for k, v in frame.__dict__.items():
+            if k in build_kwargs or k not in declared:
+                continue
+            build_kwargs[k] = v
+
+        return frame.for_cls(**build_kwargs)
+
+    def visit_with(self, node: With) -> Any:
+        """Parse ``with`` stmt. Looks up ``with_stmt`` hook on language modules."""
+        ctx = self.eval_expr(node.rhs)
+        handler = getattr(type(ctx), "__ffi_with_handler__", None)
+        if handler is not None:
+            return handler(ctx, self, node)
+        hook = self._lookup_hook("with_stmt")
+        if hook is not None:
+            return hook(self, node, ctx)
+        with self.scoped_frame(), self.push_frame(WithFrame()):
+            body = self.visit_body(node.body)
+        return (ctx, body)
+
+    def visit_while(self, node: While) -> Any:
+        """Parse ``while`` loop. Looks up ``while_stmt`` hook on language modules."""
+        cond = self.eval_expr(node.cond)
+        with self.scoped_frame(), self.push_frame(WhileFrame()):
+            body = self.visit_body(node.body)
+        hook = self._lookup_hook("while_stmt")
+        if hook is not None:
+            return hook(self, cond, body)
+        return (cond, body)
+
+    def visit_assert(self, node: Assert) -> Any:
+        """Parse ``assert cond, msg``. Looks up ``assert_stmt`` hook."""
+        cond = self.eval_expr(node.cond)
+        msg = self.eval_expr(node.msg) if node.msg is not None else None
+        hook = self._lookup_hook("assert_stmt")
+        if hook is not None:
+            return hook(self, cond, msg)
+        return (cond, msg)
+
+    def visit_assign(self, node: Assign) -> Any:
+        """Parse an assignment via the ``__ffi_assign__`` hook."""
+        assign_hook = self._lookup_hook("__ffi_assign__")
+        if assign_hook is None:
+            raise NotImplementedError(
+                "visit_assign: no ``__ffi_assign__`` hook on any registered "
+                "language module. Register one to handle pyast.Assign.",
+            )
+        return assign_hook(self, node)
+
+
+def parse(source: str | Node, lang_modules: dict[str, Any] | None = None) -> Any:
+    """Parse Python source text or a PyAST node into IR objects."""
+    return IRParser(lang_modules=lang_modules).parse(source)
+
+
 # ---------------------------------------------------------------------------
 # Re-export visitor utilities.
-# Placed after all node classes so that `_pyast_visitor` can import `Node`
-# without triggering a circular import (it does so lazily inside methods).
 # ---------------------------------------------------------------------------
 # isort: off
 from tvm_ffi._pyast_visitor import NodeTransformer as NodeTransformer  # noqa: PLC0414

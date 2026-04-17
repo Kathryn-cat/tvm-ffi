@@ -14,1116 +14,998 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-"""Language-module registration for IR dialects.
+"""Parser auto-registration — "the module is the dialect".
 
-A *dialect* is a Python module (e.g. ``tvm_ffi.testing.dialect_fixtures``) that
-declares ``@py_class`` / ``@c_class`` IR nodes and ends with a call to
-:func:`finalize_module`. Finalization walks every IR class, classifies
-each into one of the :class:`Tier` paths, and registers placeholder
-parser-dispatch handlers under the names that the printer would emit
-(``T.prim_func``, ``T.int32``, …). A sibling ``.pyi`` is regenerated
-so static type checkers see the registered surface.
+See ``design_docs/parser_auto_registration.md`` for the full design.
 
-This module only addresses **what name to register, not what to
-register**: every handler installed here is a placeholder that raises
-``NotImplementedError`` if called. Real dispatch bodies land in a
-follow-up PR.
+Short version: a dialect author writes only ``@py_class`` declarations
+on their IR classes (plus any genuinely-custom hooks), and adds one
+``finalize_module(__name__, ...)`` call at the bottom of their .py
+file. This module walks the Python module's ``@py_class`` IR classes,
+reads each ``__ffi_ir_traits__``, and auto-injects:
 
-Tiers
------
-* :attr:`Tier.MANUAL` — ``__ffi_text_print__`` is registered on the
-  class. The user supplies a manual printer and the inverse parser; the
-  registry honours their explicit ``@parse_hook`` declarations.
-* :attr:`Tier.TRAIT` — ``__ffi_ir_traits__`` is registered (and
-  :attr:`Tier.MANUAL` does not apply). Trait-driven; the per-trait rule
-  table below picks the registry slot.
-* :attr:`Tier.DEFAULT` — neither of the above. Default printing emits
-  the class name as a callee, so the registry binds the class name to
-  a default parser handler.
+* Factory attributes (``T.Add``, ``T.prim_func``, ``T.serial``, …)
+* Parser hooks (``bind``, ``buffer_store``, ``load``, ``if_stmt``,
+  ``while_stmt``, ``assert_stmt``, ``ret``, ``for_stmt``, ``with_stmt``,
+  ``__ffi_assign__``, ``__ffi_make_var__``, ``__ffi_op_classes__``, …)
+* Dtype handles and default-literal-type hooks
 
-The classifier function (:func:`_classify`) is pure and table-driven; it
-returns a list of :class:`RegEntry` for each class. ``finalize_module``
-collects every entry, applies user overrides (``@parse_hook`` on
-module-level functions, plus the kwargs to ``finalize_module``), checks
-for duplicates, and writes attributes onto the dialect module.
+directly onto the Python module so ``import tvm.script.tirx as T``
+plus ``parser = IRParser(lang_modules={"T": T})`` "just works."
+
+Precedence: **user explicit assignment wins** — every wiring rule
+uses ``if not hasattr(module, name)`` guards. If the user already
+defined ``module.ret`` or ``module.int32`` before calling
+``finalize_module``, the auto-wiring skips those names.
+
+Frame semantics follow §4.5 of the design doc — Category A pushes
+(dialect elevation on ``@T.prim_func`` / ``@R.function`` body entry)
+are emitted inside the auto-generated decorator handlers; Category C
+pushes (``ForFrame(kind=...)``, ``WithFrame()``) are emitted inside
+auto-generated iter-handler / ctx-handler methods; Category B marker
+frames are the parser core's responsibility and this module doesn't
+touch them.
 """
 
 from __future__ import annotations
 
-import enum
+import inspect
 import sys
-from dataclasses import dataclass, field
-from typing import Any, Callable
+from enum import Enum
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
-from . import _dtype
-from . import ir_traits as tr
-from ._parse_decorators import (
-    RESERVED_DICT_SLOTS,
-    RESERVED_FN_SLOTS,
-    ParseHookSpec,
-    get_hook_spec,
-    get_slot_field,
-)
-from .core import _lookup_type_attr
-from .dataclasses.py_class import _register_print_prefix
-from .pyast import OperationKind
+from tvm_ffi import pyast
+from tvm_ffi import ir_traits as tr
+from tvm_ffi._dtype import STANDARD_DTYPE_NAMES as DEFAULT_DTYPE_NAMES
+from tvm_ffi._parse_decorators import get_hook_spec, get_slot_field
+from tvm_ffi.dataclasses.py_class import _register_print_prefix
 
-# ---------------------------------------------------------------------------
-# Slot-target taxonomy
-# ---------------------------------------------------------------------------
+if TYPE_CHECKING:
+    from types import ModuleType
 
 
-# Module-level reserved slot names that hold dicts (sub-keyed by op-kind
-# or literal-format string).
-_OP_SLOT = "__ffi_parse_op__"
-_MAKE_CONST_SLOT = "__ffi_parse_make_const__"
+# ============================================================================
+# Compatibility/introspection surface from the placeholder registration pass
+# ============================================================================
 
 
-@dataclass(frozen=True)
-class RegEntry:
-    """One name-binding to install on a dialect module.
-
-    Attributes
-    ----------
-    target
-        The attribute name on the dialect module. For a free name this
-        is e.g. ``"prim_func"`` (resulting in ``T.prim_func``); for a
-        reserved C0 keyword it's the dunder itself
-        (``"__ffi_parse_func__"``).
-    handler
-        Placeholder callable to install. May be ``None`` for entries
-        that only carry a sub-key without a handler (e.g. dtype
-        instances that are non-callable).
-    sub_key
-        For dict-typed slots (``__ffi_parse_op__``,
-        ``__ffi_parse_make_const__``), the dict key under which the
-        handler lands; for direct-attr slots, ``None``.
-    source_class
-        The IR class that produced this entry; used in conflict-error
-        messages so users can see which classes collide.
-
-    """
-
-    target: str
-    handler: Callable[..., Any] | None
-    sub_key: Any = None
-    source_class: type | None = None
-
-
-# ---------------------------------------------------------------------------
-# Tier detection
-# ---------------------------------------------------------------------------
-
-
-class Tier(enum.Enum):
-    """Which registration path a class follows.
-
-    The tier is determined by which TypeAttrColumn entries are
-    registered on the class:
-
-    * :attr:`MANUAL` — ``__ffi_text_print__`` is registered. The user
-      supplies a hand-written printer + parser; the registry honours
-      explicit ``@parse_hook`` declarations and contributes nothing
-      automatically.
-    * :attr:`TRAIT` — ``__ffi_ir_traits__`` is registered (and
-      ``__ffi_text_print__`` is not). Trait-driven; the per-trait rule
-      table picks the registry slot.
-    * :attr:`DEFAULT` — neither of the above. The registry binds the
-      class name as the default callee.
-    """
+class Tier(Enum):
+    """Coarse registration tier for an IR class."""
 
     MANUAL = "manual"
     TRAIT = "trait"
     DEFAULT = "default"
 
 
-def _tier(cls: type) -> Tier:
-    """Return the registration :class:`Tier` for ``cls``.
+class _DtypeHandle:
+    """Marker base kept for older imports of ``tvm_ffi.dialect_autogen``."""
 
-    Precondition: ``cls`` is a ``@py_class`` / ``@c_class``-decorated
-    type (i.e. carries ``__tvm_ffi_type_info__``). The gate lives in
-    :func:`_classify`; this helper assumes the check has already run.
-    """
-    info = cls.__tvm_ffi_type_info__  # type: ignore[attr-defined]
-    if _lookup_type_attr(info.type_index, "__ffi_text_print__") is not None:
+
+def _tier(cls: type) -> Tier:
+    """Return the legacy registration tier for ``cls``."""
+    if not hasattr(cls, "__tvm_ffi_type_info__"):
+        return Tier.DEFAULT
+    if hasattr(cls, "__ffi_text_print__"):
         return Tier.MANUAL
-    if _lookup_type_attr(info.type_index, "__ffi_ir_traits__") is not None:
+    if hasattr(cls, "__ffi_ir_traits__"):
         return Tier.TRAIT
     return Tier.DEFAULT
 
 
-def _trait(cls: type) -> tr.IRTraits | None:
-    """Return the trait Object on ``cls`` or ``None`` if absent.
+class RegEntry:
+    """Small legacy classifier entry used by older tests and tools."""
 
-    Precondition (same as :func:`_tier`): ``cls`` carries
-    ``__tvm_ffi_type_info__``.
-    """
-    info = cls.__tvm_ffi_type_info__  # type: ignore[attr-defined]
-    val = _lookup_type_attr(info.type_index, "__ffi_ir_traits__")
-    return val if isinstance(val, tr.IRTraits) else None
+    def __init__(
+        self,
+        target: str,
+        handler: Callable[..., Any] | None = None,
+        sub_key: Any = None,
+        source_class: type | None = None,
+    ) -> None:
+        self.target = target
+        self.handler = handler
+        self.sub_key = sub_key
+        self.source_class = source_class
 
-
-# ---------------------------------------------------------------------------
-# Placeholders
-# ---------------------------------------------------------------------------
-
-
-def _placeholder(label: str) -> Callable[..., Any]:
-    """Build a parser-dispatch placeholder labelled ``label``.
-
-    The returned callable raises :class:`NotImplementedError` when
-    invoked. The label appears in the error message and as the
-    ``__name__`` so introspection tools can identify the slot.
-    """
-
-    def _dispatch(*_args: Any, **_kwargs: Any) -> Any:
-        raise NotImplementedError(
-            f"Parser dispatch for {label!r} is not yet implemented; this "
-            "build only registers the names. The handler body lands in "
-            "a follow-up PR.",
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, RegEntry):
+            return False
+        return (
+            self.target == other.target
+            and self.handler == other.handler
+            and self.sub_key == other.sub_key
+            and self.source_class == other.source_class
         )
 
-    safe = label.replace(".", "_").replace("-", "_")
-    _dispatch.__name__ = f"_parse_{safe}"
-    _dispatch.__qualname__ = _dispatch.__name__
-    _dispatch.__doc__ = f"Placeholder parser for {label!r}."
-    _dispatch.__ffi_parse_placeholder__ = True  # type: ignore[attr-defined]
-    return _dispatch
-
-
-# ---------------------------------------------------------------------------
-# Per-trait classification
-# ---------------------------------------------------------------------------
-
-
-def _label(cls: type, suffix: str) -> str:
-    """Build a placeholder label like ``"mini.tir.For:for"`` for diagnostics."""
-    return f"{cls.__module__}.{cls.__name__}:{suffix}"
-
-
-def _kind_literal(text_printer_kind: str | None) -> str | None:
-    """Return ``text_printer_kind`` if it is a literal name, else ``None``.
-
-    A trait can carry ``text_printer_kind`` as either:
-
-    * a literal callee like ``"prim_func"`` or ``"T.serial"`` — usable
-      as-is for registration (we strip the dialect prefix); or
-    * a ``$method:`` / ``$global:`` ref — opaque at registration time,
-      so the user must supply ``@parse_hook`` overrides explicitly.
-    """
-    if text_printer_kind is None:
-        return None
-    if text_printer_kind.startswith("$"):
-        return None
-    # ``"T.serial"`` → ``"serial"``; bare names pass through.
-    if "." in text_printer_kind:
-        return text_printer_kind.rsplit(".", 1)[1]
-    return text_printer_kind
-
-
-def _classify_binop(cls: type, t: tr.BinOpTraits, tier: Tier) -> list[RegEntry]:
-    if tier is Tier.DEFAULT:
-        return [_class_name_entry(cls)]
-    label = _label(cls, "binop")
-    if tier is Tier.TRAIT:
-        # Map ``op`` → OperationKind. Unknown ops (custom strings) drop
-        # the op-dict entry and rely solely on text_printer_func_name.
-        op_kind = _BINOP_BY_OP.get(t.op)
-        out: list[RegEntry] = []
-        if op_kind is not None:
-            out.append(
-                RegEntry(_OP_SLOT, _placeholder(label), op_kind, cls),
-            )
-        if t.text_printer_func_name is not None:
-            name = _kind_literal(t.text_printer_func_name)
-            if name is not None:
-                out.append(
-                    RegEntry(name, _placeholder(label), None, cls),
-                )
-        return out
-    # Tier.MANUAL — fall through to user @parse_hook overrides; the
-    # classifier contributes nothing.
-    return []
-
-
-def _classify_unaryop(cls: type, t: tr.UnaryOpTraits, tier: Tier) -> list[RegEntry]:
-    if tier is Tier.DEFAULT:
-        return [_class_name_entry(cls)]
-    if tier is Tier.TRAIT:
-        op_kind = _UNARYOP_BY_OP.get(t.op)
-        if op_kind is None:
-            return []
-        return [RegEntry(_OP_SLOT, _placeholder(_label(cls, "unop")), op_kind, cls)]
-    return []
-
-
-def _classify_value(cls: type, t: tr.ValueTraits, tier: Tier) -> list[RegEntry]:
-    if tier is Tier.DEFAULT:
-        return [_class_name_entry(cls)]
-    if tier is Tier.TRAIT:
-        return [
-            RegEntry(
-                "__ffi_parse_make_var__",
-                _placeholder(_label(cls, "make_var")),
-                None,
-                cls,
-            ),
-        ]
-    return []
-
-
-def _classify_literal(cls: type, t: tr.LiteralTraits, tier: Tier) -> list[RegEntry]:
-    if tier is Tier.DEFAULT:
-        return [_class_name_entry(cls)]
-    if tier is Tier.TRAIT:
-        fmt = t.format if t.format is not None else "default"
-        return [
-            RegEntry(
-                _MAKE_CONST_SLOT,
-                _placeholder(_label(cls, f"make_const[{fmt}]")),
-                fmt,
-                cls,
-            ),
-        ]
-    return []
-
-
-def _classify_call(cls: type, t: tr.CallTraits, tier: Tier) -> list[RegEntry]:
-    if tier is Tier.DEFAULT:
-        return [_class_name_entry(cls)]
-    if tier is Tier.TRAIT:
-        # Prefer ``text_printer_callee`` (literal); fall back to ``op``;
-        # if neither is a literal, the user must override via @parse_hook.
-        callee = (
-            _kind_literal(t.text_printer_callee)
-            if t.text_printer_callee is not None
-            else _kind_literal(t.op)
+    def __repr__(self) -> str:
+        return (
+            "RegEntry("
+            f"target={self.target!r}, handler={self.handler!r}, "
+            f"sub_key={self.sub_key!r}, source_class={self.source_class!r})"
         )
-        if callee is not None:
-            return [RegEntry(callee, _placeholder(_label(cls, "call")), None, cls)]
-        return []
-    return []
 
 
-def _classify_load(cls: type, t: tr.LoadTraits, tier: Tier) -> list[RegEntry]:
-    if tier is Tier.DEFAULT:
-        return [_class_name_entry(cls)]
-    if tier is Tier.TRAIT:
-        return [
-            RegEntry(
-                "__ffi_parse_load__",
-                _placeholder(_label(cls, "load")),
-                None,
-                cls,
-            ),
-        ]
-    return []
+# ============================================================================
+# Trait-kind → wiring-rule registry
+# ============================================================================
 
 
-def _classify_store(cls: type, t: tr.StoreTraits, tier: Tier) -> list[RegEntry]:
-    if tier is Tier.DEFAULT:
-        return [_class_name_entry(cls)]
-    if tier is Tier.TRAIT:
-        return [
-            RegEntry(
-                "__ffi_parse_store__",
-                _placeholder(_label(cls, "store")),
-                None,
-                cls,
-            ),
-        ]
-    return []
+_WIRING_RULES: dict[type, Callable] = {}
 
 
-def _classify_assign(cls: type, t: tr.AssignTraits, tier: Tier) -> list[RegEntry]:
-    if tier is Tier.DEFAULT:
-        return [_class_name_entry(cls)]
-    if tier is Tier.TRAIT:
-        kind = _kind_literal(t.text_printer_kind)
-        if kind is not None:
-            return [RegEntry(kind, _placeholder(_label(cls, "assign")), None, cls)]
-        return [
-            RegEntry(
-                "__ffi_parse_assign__",
-                _placeholder(_label(cls, "assign")),
-                None,
-                cls,
-            ),
-        ]
-    return []
+def _wiring_rule(trait_cls: type) -> Callable:
+    """Decorator: register ``fn`` as the wiring rule for ``trait_cls``."""
+
+    def _decorator(fn: Callable) -> Callable:
+        _WIRING_RULES[trait_cls] = fn
+        return fn
+
+    return _decorator
 
 
-def _classify_assert(cls: type, t: tr.AssertTraits, tier: Tier) -> list[RegEntry]:
-    if tier is Tier.DEFAULT:
-        return [_class_name_entry(cls)]
-    if tier is Tier.TRAIT:
-        return [
-            RegEntry(
-                "__ffi_parse_assert__",
-                _placeholder(_label(cls, "assert")),
-                None,
-                cls,
-            ),
-        ]
-    return []
+# ============================================================================
+# Utility: trait-ref helpers
+# ============================================================================
 
 
-def _classify_return(cls: type, t: tr.ReturnTraits, tier: Tier) -> list[RegEntry]:
-    if tier is Tier.DEFAULT:
-        return [_class_name_entry(cls)]
-    if tier is Tier.TRAIT:
-        return [
-            RegEntry(
-                "__ffi_parse_return__",
-                _placeholder(_label(cls, "return")),
-                None,
-                cls,
-            ),
-        ]
-    return []
+def _strip_field_prefix(ref: Any) -> Optional[str]:
+    """``"$field:name"`` → ``"name"``; returns ``None`` if ``ref`` isn't
+    a ``$field:`` ref (may be ``None``, a literal, a ``$method:`` ref,
+    etc.)."""
+    if isinstance(ref, str) and ref.startswith("$field:"):
+        return ref[len("$field:"):]
+    return None
 
 
-def _classify_func(cls: type, t: tr.FuncTraits, tier: Tier) -> list[RegEntry]:
-    if tier is Tier.DEFAULT:
-        return [_class_name_entry(cls)]
-    if tier is Tier.TRAIT:
-        kind = _kind_literal(t.text_printer_kind)
-        if kind is not None:
-            return [RegEntry(kind, _placeholder(_label(cls, "func")), None, cls)]
-        return [
-            RegEntry(
-                "__ffi_parse_func__",
-                _placeholder(_label(cls, "func")),
-                None,
-                cls,
-            ),
-        ]
-    return []
+def _literal_prefix_name(ref: Optional[str]) -> Optional[tuple[str, str]]:
+    """``"T.prim_func"`` → ``("T", "prim_func")``; returns ``None`` when
+    ``ref`` is ``None`` or doesn't have exactly one ``.`` separator."""
+    if not isinstance(ref, str) or "." not in ref or ref.startswith("$"):
+        return None
+    parts = ref.split(".", 1)
+    if len(parts) != 2:
+        return None
+    return parts[0], parts[1]
 
 
-def _classify_for(cls: type, t: tr.ForTraits, tier: Tier) -> list[RegEntry]:
-    if tier is Tier.DEFAULT:
-        return [_class_name_entry(cls)]
-    if tier is Tier.TRAIT:
-        # Three-way:
-        #   * ``text_printer_kind`` is None  → bind ``__ffi_parse_for__``
-        #     so ``finalize_module(iter_aliases={"range": "T.serial"})``
-        #     can install the ``range`` alias on top.
-        #   * literal kind (``"serial"`` or ``"T.serial"``) → register
-        #     that name directly.
-        #   * opaque ``$method:`` / ``$global:`` ref → emit nothing; the
-        #     user must enumerate kinds with
-        #     ``@parse_hook(["serial", "parallel", ...])``.
-        if t.text_printer_kind is None:
-            return [
-                RegEntry(
-                    "__ffi_parse_for__",
-                    _placeholder(_label(cls, "for")),
-                    None,
-                    cls,
-                ),
-            ]
-        kind = _kind_literal(t.text_printer_kind)
-        if kind is not None:
-            return [RegEntry(kind, _placeholder(_label(cls, "for")), None, cls)]
-        return []
-    return []
+# ============================================================================
+# Primitive-wrapping helper (used by auto-generated op factories to lift
+# raw Python primitives into Imm IRs via the module's default-ty hooks)
+# ============================================================================
 
 
-def _classify_with(cls: type, t: tr.WithTraits, tier: Tier) -> list[RegEntry]:
-    if tier is Tier.DEFAULT:
-        return [_class_name_entry(cls)]
-    if tier is Tier.TRAIT:
-        # Mirrors ``_classify_for``:
-        #   * None              → reserved ``__ffi_parse_with__`` slot.
-        #   * literal kind       → register that name directly.
-        #   * ``$method`/$global → empty; user supplies ``@parse_hook``.
-        if t.text_printer_kind is None:
-            return [
-                RegEntry(
-                    "__ffi_parse_with__",
-                    _placeholder(_label(cls, "with")),
-                    None,
-                    cls,
-                ),
-            ]
-        kind = _kind_literal(t.text_printer_kind)
-        if kind is not None:
-            return [RegEntry(kind, _placeholder(_label(cls, "with")), None, cls)]
-        return []
-    return []
+def _wrap_primitive_via_module(value: Any, module: "ModuleType") -> Any:
+    """Wrap ``value`` using ``module.__ffi_default_{bool,int,float}_ty__``
+    handles when available. If the module hasn't declared defaults (or
+    the value is already an ffi Object), pass through unchanged."""
+    from tvm_ffi import Object  # noqa: PLC0415
+
+    if value is None or isinstance(value, Object):
+        return value
+    if isinstance(value, bool):
+        handle = getattr(module, "__ffi_default_bool_ty__", None)
+        if handle is not None and callable(handle):
+            return handle(int(value))
+        return value
+    if isinstance(value, int):
+        handle = getattr(module, "__ffi_default_int_ty__", None)
+        if handle is not None and callable(handle):
+            return handle(int(value))
+        return value
+    if isinstance(value, float):
+        handle = getattr(module, "__ffi_default_float_ty__", None)
+        if handle is not None and callable(handle):
+            return handle(float(value))
+        return value
+    return value
 
 
-def _classify_while(cls: type, t: tr.WhileTraits, tier: Tier) -> list[RegEntry]:
-    if tier is Tier.DEFAULT:
-        return [_class_name_entry(cls)]
-    if tier is Tier.TRAIT:
-        return [
-            RegEntry(
-                "__ffi_parse_while__",
-                _placeholder(_label(cls, "while")),
-                None,
-                cls,
-            ),
-        ]
-    return []
+# ============================================================================
+# OperationKind symbol → kind integer table (for auto op_classes map)
+# ============================================================================
 
 
-def _classify_if(cls: type, t: tr.IfTraits, tier: Tier) -> list[RegEntry]:
-    if tier is Tier.DEFAULT:
-        return [_class_name_entry(cls)]
-    if tier is Tier.TRAIT:
-        return [
-            RegEntry(
-                "__ffi_parse_if__",
-                _placeholder(_label(cls, "if")),
-                None,
-                cls,
-            ),
-        ]
-    return []
+_BINOP_SYMBOL_TO_KIND: dict[str, int] = {
+    "+": pyast.OperationKind.Add,
+    "-": pyast.OperationKind.Sub,
+    "*": pyast.OperationKind.Mult,
+    "/": pyast.OperationKind.Div,
+    "//": pyast.OperationKind.FloorDiv,
+    "%": pyast.OperationKind.Mod,
+    "**": pyast.OperationKind.Pow,
+    "<<": pyast.OperationKind.LShift,
+    ">>": pyast.OperationKind.RShift,
+    "&": pyast.OperationKind.BitAnd,
+    "|": pyast.OperationKind.BitOr,
+    "^": pyast.OperationKind.BitXor,
+    "<": pyast.OperationKind.Lt,
+    "<=": pyast.OperationKind.LtE,
+    "==": pyast.OperationKind.Eq,
+    "!=": pyast.OperationKind.NotEq,
+    ">": pyast.OperationKind.Gt,
+    ">=": pyast.OperationKind.GtE,
+    "and": pyast.OperationKind.And,
+    "or": pyast.OperationKind.Or,
+}
+
+_UNARYOP_SYMBOL_TO_KIND: dict[str, int] = {
+    "-": pyast.OperationKind.USub,
+    "+": pyast.OperationKind.UAdd,
+    "~": pyast.OperationKind.Invert,
+    "not": pyast.OperationKind.Not,
+}
 
 
-def _classify_prim_ty(cls: type, t: tr.PrimTyTraits, tier: Tier) -> list[RegEntry]:
-    # Per design: PrimTy classes don't claim a single registry name —
-    # the dtype handles (T.int32, T.float32, …) handle that surface,
-    # registered separately in finalize_module(). DEFAULT-tier classes
-    # still land their class name so a default Call(...) parse can
-    # resolve.
-    if tier is Tier.DEFAULT:
-        return [_class_name_entry(cls)]
-    return []
+# ============================================================================
+# Legacy pure classifier helpers
+# ============================================================================
 
 
-def _classify_type_named(cls: type, tier: Tier, name: str) -> list[RegEntry]:
-    """Apply the common per-type-trait shape: register one fixed name.
-
-    Used by ``BufferTy`` / ``TensorTy`` / ``FuncTy`` / ``TupleTy`` /
-    ``ShapeTy``: each trait registers exactly one callee name.
-    """
-    if tier is Tier.DEFAULT:
-        return [_class_name_entry(cls)]
-    if tier is Tier.TRAIT:
-        return [RegEntry(name, _placeholder(_label(cls, name.lower())), None, cls)]
-    return []
+def _literal_name(ref: Optional[str]) -> Optional[str]:
+    """Return the final attribute name for a literal callee/kind ref."""
+    if not isinstance(ref, str) or ref.startswith("$"):
+        return None
+    return ref.rsplit(".", 1)[-1] if "." in ref else ref
 
 
 def _class_name_entry(cls: type) -> RegEntry:
-    """DEFAULT-tier / fallback: register the class name as the callee target."""
-    return RegEntry(cls.__name__, _placeholder(_label(cls, "default")), None, cls)
+    return RegEntry(cls.__name__, None, None, cls)
 
 
-# Trait → classifier dispatch table. Order matters when subclasses are
-# present (more specific traits should appear before bases); since the
-# trait hierarchy is shallow we just match on ``type(...) is`` exactly.
-_CLASSIFIERS: list[tuple[type, Callable[..., list[RegEntry]]]] = [
-    (tr.BinOpTraits, _classify_binop),
-    (tr.UnaryOpTraits, _classify_unaryop),
-    (tr.ValueTraits, _classify_value),
-    (tr.LiteralTraits, _classify_literal),
-    (tr.CallTraits, _classify_call),
-    (tr.LoadTraits, _classify_load),
-    (tr.StoreTraits, _classify_store),
-    (tr.AssignTraits, _classify_assign),
-    (tr.AssertTraits, _classify_assert),
-    (tr.ReturnTraits, _classify_return),
-    (tr.FuncTraits, _classify_func),
-    (tr.ForTraits, _classify_for),
-    (tr.WithTraits, _classify_with),
-    (tr.WhileTraits, _classify_while),
-    (tr.IfTraits, _classify_if),
-    (tr.PrimTyTraits, _classify_prim_ty),
-    (tr.TensorTyTraits, lambda c, _t, ti: _classify_type_named(c, ti, "Tensor")),
-    (tr.BufferTyTraits, lambda c, _t, ti: _classify_type_named(c, ti, "Buffer")),
-    (tr.FuncTyTraits, lambda c, _t, ti: _classify_type_named(c, ti, "FuncType")),
-    (tr.TupleTyTraits, lambda c, _t, ti: _classify_type_named(c, ti, "Tuple")),
-    (tr.ShapeTyTraits, lambda c, _t, ti: _classify_type_named(c, ti, "Shape")),
-]
+def _classify(cls: type) -> list[RegEntry]:  # noqa: PLR0911, PLR0912
+    """Return the legacy registration slots that ``cls`` would claim.
 
-
-# Mapping from ``BinOpTraits.op`` strings to ``OperationKind`` values.
-# Only kinds the printer would render via the OperationAST sugar path
-# qualify; custom op strings (handled via ``text_printer_func_name``)
-# don't get a ``__ffi_parse_op__`` slot.
-_BINOP_BY_OP: dict[str, int] = {
-    "+": OperationKind.Add,
-    "-": OperationKind.Sub,
-    "*": OperationKind.Mult,
-    "/": OperationKind.Div,
-    "//": OperationKind.FloorDiv,
-    "%": OperationKind.Mod,
-    "**": OperationKind.Pow,
-    "<<": OperationKind.LShift,
-    ">>": OperationKind.RShift,
-    "&": OperationKind.BitAnd,
-    "|": OperationKind.BitOr,
-    "^": OperationKind.BitXor,
-    "<": OperationKind.Lt,
-    "<=": OperationKind.LtE,
-    "==": OperationKind.Eq,
-    "!=": OperationKind.NotEq,
-    ">": OperationKind.Gt,
-    ">=": OperationKind.GtE,
-    "and": OperationKind.And,
-    "or": OperationKind.Or,
-    "@": OperationKind.MatMult,
-}
-
-_UNARYOP_BY_OP: dict[str, int] = {
-    "-": OperationKind.USub,
-    "+": OperationKind.UAdd,
-    "~": OperationKind.Invert,
-    "not": OperationKind.Not,
-}
-
-
-def _classify(cls: type) -> list[RegEntry]:
-    """Top-level classifier: dispatch on the class's tier and trait.
-
-    Returns ``[]`` for any class that is not a ``@py_class`` /
-    ``@c_class`` (i.e. lacks ``__tvm_ffi_type_info__``) — finalize_module
-    has no business registering names for non-FFI types. The gate lives
-    here so :func:`_tier` and :func:`_trait` can stay lean.
+    The concrete parser no longer consumes these entries internally, but
+    older tests and inspection tools still use the pure classifier to
+    reason about the dialect surface.
     """
-    if getattr(cls, "__tvm_ffi_type_info__", None) is None:
+    if not hasattr(cls, "__tvm_ffi_type_info__"):
         return []
     tier = _tier(cls)
     if tier is Tier.MANUAL:
-        # MANUAL tier contributes no auto-registered entries; the
-        # user's ``@parse_hook`` decorations land them.
         return []
     if tier is Tier.DEFAULT:
         return [_class_name_entry(cls)]
-    # tier is Tier.TRAIT
-    trait = _trait(cls)
-    if trait is None:
-        # Defensive: TRAIT was selected only because __ffi_ir_traits__
-        # was set, but the value isn't a trait Object. Fall through to
-        # the default-callee path.
-        return [_class_name_entry(cls)]
-    for trait_cls, classifier in _CLASSIFIERS:
-        if type(trait) is trait_cls:
-            return classifier(cls, trait, tier)
-    # Unknown trait subclass — treat as default.
-    return [_class_name_entry(cls)]
+
+    trait = getattr(cls, "__ffi_ir_traits__", None)
+    if isinstance(trait, tr.BinOpTraits):
+        out: list[RegEntry] = []
+        op_kind = _BINOP_SYMBOL_TO_KIND.get(trait.op)
+        if op_kind is not None:
+            out.append(RegEntry("__ffi_parse_op__", None, op_kind, cls))
+        name = _literal_name(trait.text_printer_func_name)
+        if name is not None:
+            out.append(RegEntry(name, None, None, cls))
+        return out
+    if isinstance(trait, tr.UnaryOpTraits):
+        op_kind = _UNARYOP_SYMBOL_TO_KIND.get(trait.op)
+        return (
+            [RegEntry("__ffi_parse_op__", None, op_kind, cls)]
+            if op_kind is not None else []
+        )
+    if isinstance(trait, tr.ValueTraits):
+        return [RegEntry("__ffi_parse_make_var__", None, None, cls)]
+    if isinstance(trait, tr.LiteralTraits):
+        return [
+            RegEntry(
+                "__ffi_parse_make_const__",
+                None,
+                trait.format if trait.format is not None else "default",
+                cls,
+            ),
+        ]
+    if isinstance(trait, tr.CallTraits):
+        name = _literal_name(trait.text_printer_callee or trait.op)
+        return [RegEntry(name, None, None, cls)] if name is not None else []
+    if isinstance(trait, tr.LoadTraits):
+        return [RegEntry("__ffi_parse_load__", None, None, cls)]
+    if isinstance(trait, tr.StoreTraits):
+        return [RegEntry("__ffi_parse_store__", None, None, cls)]
+    if isinstance(trait, tr.AssignTraits):
+        name = _literal_name(trait.text_printer_kind)
+        return [RegEntry(name or "__ffi_parse_assign__", None, None, cls)]
+    if isinstance(trait, tr.AssertTraits):
+        return [RegEntry("__ffi_parse_assert__", None, None, cls)]
+    if isinstance(trait, tr.ReturnTraits):
+        return [RegEntry("__ffi_parse_return__", None, None, cls)]
+    if isinstance(trait, tr.FuncTraits):
+        name = _literal_name(trait.text_printer_kind)
+        return [RegEntry(name or "__ffi_parse_func__", None, None, cls)]
+    if isinstance(trait, tr.ForTraits):
+        name = _literal_name(trait.text_printer_kind)
+        if trait.text_printer_kind is None:
+            return [RegEntry("__ffi_parse_for__", None, None, cls)]
+        return [RegEntry(name, None, None, cls)] if name is not None else []
+    if isinstance(trait, tr.WithTraits):
+        name = _literal_name(trait.text_printer_kind)
+        if trait.text_printer_kind is None:
+            return [RegEntry("__ffi_parse_with__", None, None, cls)]
+        return [RegEntry(name, None, None, cls)] if name is not None else []
+    if isinstance(trait, tr.WhileTraits):
+        return [RegEntry("__ffi_parse_while__", None, None, cls)]
+    if isinstance(trait, tr.IfTraits):
+        return [RegEntry("__ffi_parse_if__", None, None, cls)]
+    if isinstance(trait, tr.PrimTyTraits):
+        return []
+    if isinstance(trait, tr.TensorTyTraits):
+        return [RegEntry("Tensor", None, None, cls)]
+    if isinstance(trait, tr.BufferTyTraits):
+        return [RegEntry("Buffer", None, None, cls)]
+    if isinstance(trait, tr.FuncTyTraits):
+        return [RegEntry("FuncType", None, None, cls)]
+    if isinstance(trait, tr.TupleTyTraits):
+        return [RegEntry("Tuple", None, None, cls)]
+    if isinstance(trait, tr.ShapeTyTraits):
+        return [RegEntry("Shape", None, None, cls)]
+    return []
 
 
-# ---------------------------------------------------------------------------
-# Dtype handle (the multi-mode T.int32 surface)
-# ---------------------------------------------------------------------------
+# ============================================================================
+# Wiring rules — one per trait kind
+# ============================================================================
 
 
-@dataclass
-class _DtypeHandle:
-    """Multi-mode dispatcher for a single dtype name on a dialect module.
+@_wiring_rule(tr.BinOpTraits)
+def _wire_binop(module: "ModuleType", cls: type, trait: Any, ctx: dict) -> None:
+    """Record a sugar-path :func:`parse_binop` closure for ``cls``
+    directly in ``ctx["op_classes_map"]``.
 
-    ``T.int32`` evaluates to a ``_DtypeHandle`` whose ``.dtype`` is the
-    underlying :class:`tvm_ffi.dtype`. Calling it routes:
-
-    * ``T.int32(var_name="x")`` → ``__ffi_parse_make_var__`` placeholder
-    * ``T.int32(value=42)``     → ``__ffi_parse_make_const__["int"]``
-      (or ``["float"]`` / ``["bool"]`` based on the dtype kind)
-    * ``T.int32()``             → returns the handle itself (acts as a
-      bare ``PrimTy`` placeholder)
-
-    All routes are placeholders in this PR — they raise
-    ``NotImplementedError``. The structure exists so the registered
-    name surface matches what the printer emits.
+    Post ``parser_dtype_defaults_refactor.md`` §7: no per-class
+    ``_ffi_parse_op`` static method is installed — the closure goes
+    straight into the dict, and :meth:`IRParser.visit_operation` calls
+    it with ``(parser, op_node)``. The IR class stays pure data; the
+    de-sugared call form ``T.Add(a, b)`` still invokes the class
+    constructor positionally (independent of this map).
     """
+    from tvm_ffi.pyast_trait_parse import parse_binop  # noqa: PLC0415
 
-    dtype: Any  # tvm_ffi.dtype instance
-    name: str  # canonical dtype string (e.g. "int32")
-    module: Any = None  # set by finalize_module after registration
+    def _binop(parser: Any, op_node: Any, _cls: type = cls) -> Any:
+        return parse_binop(parser, op_node, ir_class=_cls)
 
-    def __call__(self, *args: Any, var_name: Any = None, value: Any = None, **kw: Any) -> Any:
-        if var_name is not None:
-            handler = _module_attr(self.module, "__ffi_parse_make_var__")
-            return handler(self.dtype, var_name=var_name, **kw)
-        if value is not None:
-            const_dict = _module_attr(self.module, "__ffi_parse_make_const__")
-            fmt = _dtype_const_format(self.name)
-            handler = const_dict.get(fmt) if isinstance(const_dict, dict) else None
-            if handler is None:
-                raise NotImplementedError(
-                    f"No __ffi_parse_make_const__[{fmt!r}] handler "
-                    f"registered on dialect for dtype {self.name!r}.",
+    _binop.__name__ = f"_binop_{cls.__name__}"
+
+    op_kind = _BINOP_SYMBOL_TO_KIND.get(trait.op)
+    if op_kind is not None:
+        ctx["op_classes_map"].setdefault(op_kind, _binop)
+
+
+@_wiring_rule(tr.UnaryOpTraits)
+def _wire_unaryop(module: "ModuleType", cls: type, trait: Any, ctx: dict) -> None:
+    """Unary-op analog of :func:`_wire_binop` — closure directly in
+    ``ctx["op_classes_map"]``; no ``cls._ffi_parse_op`` mutation."""
+    from tvm_ffi.pyast_trait_parse import parse_unaryop  # noqa: PLC0415
+
+    def _unaryop(parser: Any, op_node: Any, _cls: type = cls) -> Any:
+        return parse_unaryop(parser, op_node, ir_class=_cls)
+
+    _unaryop.__name__ = f"_unaryop_{cls.__name__}"
+
+    op_kind = _UNARYOP_SYMBOL_TO_KIND.get(trait.op)
+    if op_kind is not None:
+        ctx["op_classes_map"].setdefault(op_kind, _unaryop)
+
+
+@_wiring_rule(tr.LoadTraits)
+def _wire_load(module: "ModuleType", cls: type, trait: Any, ctx: dict) -> None:
+    """Register the ``load`` hook → build a ``LoadTraits`` IR from
+    ``A[indices]`` subscripts."""
+    source_field = _strip_field_prefix(trait.source) or "source"
+    indices_field = _strip_field_prefix(trait.indices) or "indices"
+
+    def _load_hook(_parser: Any, obj: Any, indices: list) -> Any:
+        wrapped = [_wrap_primitive_via_module(i, module) for i in indices]
+        return cls(**{source_field: obj, indices_field: wrapped})
+
+    if not hasattr(module, "load"):
+        module.load = _load_hook  # type: ignore[attr-defined]
+
+
+@_wiring_rule(tr.AssignTraits)
+def _wire_assign(module: "ModuleType", cls: type, trait: Any, ctx: dict) -> None:
+    """Dual-mode wiring for ``AssignTraits``:
+
+    * ``def_values`` set (normal bind ``v = expr``): register as the
+      ``bind`` hook — contributes to the ``__ffi_assign__`` router.
+    * ``def_values=None`` with literal ``text_printer_kind`` (expr-stmt
+      like ``T.evaluate(x)``): register a call factory under that name
+      — ``visit_call`` resolves to it when parsing the print form.
+    """
+    if trait.def_values is None:
+        # Expression-statement mode: register a call factory under
+        # ``text_printer_kind`` name (e.g. ``T.evaluate``).
+        parts = _literal_prefix_name(trait.text_printer_kind)
+        if not parts:
+            return  # dynamic kind — can't auto-name
+        attr_name = parts[1]
+        rhs_field = _strip_field_prefix(trait.rhs) or "value"
+
+        def _exprstmt_factory(*args: Any) -> Any:
+            if len(args) != 1:
+                raise TypeError(
+                    f"{attr_name}: expected 1 arg, got {len(args)}",
                 )
-            return handler(self.dtype, value=value, **kw)
-        if args or kw:
-            raise TypeError(
-                f"{self.name}: pass exactly one of var_name=... or "
-                "value=...; positional args not accepted.",
+            return cls(**{rhs_field: _wrap_primitive_via_module(args[0], module)})
+
+        _exprstmt_factory.__name__ = attr_name
+        if not hasattr(module, attr_name):
+            setattr(module, attr_name, _exprstmt_factory)
+        return
+
+    # Normal bind: ``v = expr`` → cls(var=v, value=expr).
+    var_field = _strip_field_prefix(trait.def_values) or "var"
+    rhs_field = _strip_field_prefix(trait.rhs) or "value"
+
+    def _bind_hook(_parser: Any, var: Any, rhs: Any) -> Any:
+        return cls(**{var_field: var, rhs_field: rhs})
+
+    if not hasattr(module, "bind"):
+        module.bind = _bind_hook  # type: ignore[attr-defined]
+
+    ctx.setdefault("_has_assign_bind", cls)
+
+
+@_wiring_rule(tr.StoreTraits)
+def _wire_store(module: "ModuleType", cls: type, trait: Any, ctx: dict) -> None:
+    """Register the ``buffer_store`` hook → build a ``StoreTraits`` IR
+    from subscript-target assignments (``A[i] = v``).
+
+    Contributes to the per-module ``__ffi_assign__`` router only when
+    the same module also has a bind class (``AssignTraits``). Without a
+    bind class, installing a partial router would shadow a cross-dialect
+    ``__shared__.__ffi_assign__`` via :meth:`_lookup_hook` — so we just
+    register the ``buffer_store`` hook and leave routing to the host.
+    """
+    target_field = _strip_field_prefix(trait.target) or "target"
+    value_field = _strip_field_prefix(trait.value) or "value"
+    indices_field = _strip_field_prefix(trait.indices) if trait.indices else None
+
+    def _buffer_store_hook(
+        _parser: Any, target: Any, indices: list, value: Any,
+    ) -> Any:
+        kwargs: dict[str, Any] = {
+            target_field: target,
+            value_field: _wrap_primitive_via_module(value, module),
+        }
+        if indices_field is not None:
+            kwargs[indices_field] = [
+                _wrap_primitive_via_module(i, module) for i in indices
+            ]
+        return cls(**kwargs)
+
+    if not hasattr(module, "buffer_store"):
+        module.buffer_store = _buffer_store_hook  # type: ignore[attr-defined]
+
+    ctx.setdefault("_has_assign_store", cls)
+
+
+def _ensure_assign_router(module: "ModuleType", ctx: dict) -> None:
+    """Install the ``__ffi_assign__`` router once at least one of
+    bind/store has been wired on this module.
+
+    Routes Id-lhs to :func:`parse_assign` with the bind class; Index-lhs
+    to :func:`parse_store` with the store class. When one side is
+    missing on this module, the router delegates to other active
+    dialects' ``__ffi_assign__`` hooks — this keeps cross-dialect
+    compositions like mini.mlir's ``_SharedHooks`` (full router) +
+    per-dialect partial router (e.g. memref has only store) from
+    shadowing each other.
+    """
+    store_cls = ctx.get("_has_assign_store")
+    bind_cls = ctx.get("_has_assign_bind")
+    if store_cls is None and bind_cls is None:
+        return
+
+    def _router(parser: Any, node: Any,
+                _store: Optional[type] = store_cls,
+                _bind: Optional[type] = bind_cls,
+                _this_module: "ModuleType" = module) -> Any:
+        # Route to the owning class's *dispatcher* (not directly to
+        # ``parse_assign`` / ``parse_store``) so a user-supplied
+        # ``__ffi_text_parse__`` on the class wins over trait parsing.
+        # See design_docs/parser_tier_dispatch.md §7.
+        from tvm_ffi.parse_dispatch import lookup_parser  # noqa: PLC0415
+
+        is_index = isinstance(node.lhs, pyast.Index)
+        target_cls = _store if is_index else _bind
+        if target_cls is not None:
+            owner = sys.modules.get(target_cls.__module__)
+            dispatcher = (
+                lookup_parser(owner, target_cls.__name__)
+                if owner is not None else None
             )
-        return self  # bare PrimTy reference
+            if dispatcher is not None:
+                return dispatcher(parser, node)
+            # No dispatcher — fall back to direct trait-parse
+            # invocation. Should not happen under normal wiring (the
+            # register_parser pass runs before trait rules).
+            from tvm_ffi.pyast_trait_parse import (  # noqa: PLC0415
+                parse_assign, parse_store,
+            )
 
-    def __repr__(self) -> str:
-        return f"<dtype handle T.{self.name}>"
+            parse_fn = parse_store if is_index else parse_assign
+            return parse_fn(parser, node, target_cls)
 
-
-def _module_attr(module: Any, name: str) -> Any:
-    """Look up a parser-protocol slot, raising if unset."""
-    val = getattr(module, name, None)
-    if val is None:
+        # Partial router — delegate to another dialect that provides
+        # the missing half.
+        for dialect in parser.active_dialects():
+            if dialect is _this_module:
+                continue
+            other = getattr(dialect, "__ffi_assign__", None)
+            if other is not None:
+                return other(parser, node)
         raise NotImplementedError(
-            f"Dialect module {getattr(module, '__name__', '?')!r} has no {name!r} registered.",
+            f"{_this_module.__name__}: partial ``__ffi_assign__`` router "
+            f"cannot handle {'Index' if is_index else 'Id'}-lhs and no "
+            "other active dialect provides a fallback.",
         )
-    return val
+
+    if not hasattr(module, "__ffi_assign__"):
+        module.__ffi_assign__ = _router  # type: ignore[attr-defined]
 
 
-def _dtype_const_format(dtype_name: str) -> str:
-    """Map a dtype string to its LiteralTraits-format key."""
-    if dtype_name == "bool":
-        return "bool"
-    if dtype_name.startswith(("int", "uint")):
-        return "int"
-    return "float"
+@_wiring_rule(tr.ReturnTraits)
+def _wire_return(module: "ModuleType", cls: type, trait: Any, ctx: dict) -> None:
+    """Register the ``ret`` hook → build a ``ReturnTraits`` IR from
+    ``return expr``."""
+    value_field = _strip_field_prefix(trait.value) or "value"
+
+    def _ret_hook(_parser: Any, value: Any) -> Any:
+        return cls(**{value_field: _wrap_primitive_via_module(value, module)})
+
+    if not hasattr(module, "ret"):
+        module.ret = _ret_hook  # type: ignore[attr-defined]
 
 
-# ---------------------------------------------------------------------------
-# Default dtype set
-# ---------------------------------------------------------------------------
+@_wiring_rule(tr.IfTraits)
+def _wire_if(module: "ModuleType", cls: type, trait: Any, ctx: dict) -> None:
+    """Register the ``if_stmt`` hook → build an ``IfTraits`` IR.
 
-
-#: The dtypes registered on every dialect by default. Mirrors the
-#: literal block in :mod:`tvm_ffi._dtype` (lines 331-351).
-DEFAULT_DTYPE_NAMES: tuple[str, ...] = (
-    "bool",
-    "int8",
-    "int16",
-    "int32",
-    "int64",
-    "uint8",
-    "uint16",
-    "uint32",
-    "uint64",
-    "float16",
-    "float32",
-    "float64",
-    "bfloat16",
-    "float8_e4m3fn",
-    "float8_e4m3fnuz",
-    "float8_e5m2",
-    "float8_e5m2fnuz",
-    "float8_e8m0fnu",
-    "float4_e2m1fnx2",
-)
-
-
-# ---------------------------------------------------------------------------
-# Conflict-resolved registry
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class _Registry:
-    """Mutable accumulator collecting :class:`RegEntry` rows by target.
-
-    Each binding tracks whether it came from a user override
-    (``@parse_hook`` at module scope) or from the classifier; the latter
-    raises on duplicate, the former silently shadows future classifier
-    entries for the same slot.
+    No frame push here: ``pyast.IRParser.visit_if`` already pushes
+    :class:`pyast.IfFrame` around each branch before calling the hook.
     """
+    cond_field = _strip_field_prefix(trait.cond) or "cond"
+    then_field = _strip_field_prefix(trait.then_region.body) or "then_body"
+    else_field: Optional[str] = None
+    if trait.else_region is not None:
+        else_field = _strip_field_prefix(trait.else_region.body) or "else_body"
 
-    # Map from ``target`` to either:
-    # * a single RegEntry (no sub-key) — for free-name and reserved-fn slots
-    # * a dict[sub_key, RegEntry] — for the two reserved-dict slots
-    bindings: dict[str, Any] = field(default_factory=dict)
-    # Set of (target, sub_key) pairs that came from user overrides.
-    overridden: set[tuple[str, Any]] = field(default_factory=set)
+    def _if_stmt_hook(
+        _parser: Any, cond: Any, then_body: list, else_body: list,
+    ) -> Any:
+        kwargs: dict[str, Any] = {cond_field: cond, then_field: then_body}
+        if else_field is not None:
+            kwargs[else_field] = else_body
+        return cls(**kwargs)
 
-    def add(self, entry: RegEntry, *, override: bool = False) -> None:
-        target = entry.target
-        key = (target, entry.sub_key)
-        if target in RESERVED_DICT_SLOTS:
-            sub = self.bindings.setdefault(target, {})
-            if not isinstance(sub, dict):
-                raise _conflict(
-                    target,
-                    None,
-                    sub.source_class if isinstance(sub, RegEntry) else None,
-                    entry.source_class,
-                )
-            existing = sub.get(entry.sub_key)
-            if existing is not None:
-                if override and key in self.overridden:
-                    # Two ``@parse_hook`` overrides claiming the same
-                    # slot — unambiguously a user error.
-                    raise _override_conflict(target, entry.sub_key, existing, entry)
-                if not override and key in self.overridden:
-                    # User override already claimed this slot; classifier
-                    # silently steps aside.
-                    return
-                if not override:
-                    raise _conflict(
-                        target,
-                        entry.sub_key,
-                        existing.source_class,
-                        entry.source_class,
-                    )
-            sub[entry.sub_key] = entry
-            if override:
-                self.overridden.add(key)
-            return
-        existing = self.bindings.get(target)
-        if existing is not None:
-            if override and key in self.overridden:
-                # Two ``@parse_hook`` overrides on the same target.
-                raise _override_conflict(target, None, existing, entry)
-            if not override and key in self.overridden:
-                return  # user override wins; skip classifier entry
-            if not override:
-                existing_cls = existing.source_class if isinstance(existing, RegEntry) else None
-                raise _conflict(target, None, existing_cls, entry.source_class)
-        self.bindings[target] = entry
-        if override:
-            self.overridden.add(key)
+    if not hasattr(module, "if_stmt"):
+        module.if_stmt = _if_stmt_hook  # type: ignore[attr-defined]
 
 
-def _conflict(
-    target: str,
-    sub_key: Any,
-    cls_a: type | None,
-    cls_b: type | None,
-) -> RuntimeError:
-    sub = f"[{sub_key!r}]" if sub_key is not None else ""
-    a = cls_a.__name__ if cls_a is not None else "<unknown>"
-    b = cls_b.__name__ if cls_b is not None else "<unknown>"
-    return RuntimeError(
-        f"finalize_module: duplicate registration for {target}{sub} "
-        f"(claimed by both {a} and {b}). Resolve by passing an explicit "
-        f"override into finalize_module(...) or decorating a manual "
-        f"parser with @parse_hook.",
-    )
+@_wiring_rule(tr.WhileTraits)
+def _wire_while(module: "ModuleType", cls: type, trait: Any, ctx: dict) -> None:
+    """Register the ``while_stmt`` hook → build a ``WhileTraits`` IR."""
+    cond_field = _strip_field_prefix(trait.cond) or "cond"
+    body_field = _strip_field_prefix(trait.region.body) or "body"
+
+    def _while_hook(_parser: Any, cond: Any, body: list) -> Any:
+        return cls(**{cond_field: cond, body_field: body})
+
+    if not hasattr(module, "while_stmt"):
+        module.while_stmt = _while_hook  # type: ignore[attr-defined]
 
 
-def _override_conflict(
-    target: str,
-    sub_key: Any,
-    existing: RegEntry,
-    incoming: RegEntry,
-) -> RuntimeError:
-    """Two ``@parse_hook`` decorators claim the same slot — user error.
+@_wiring_rule(tr.AssertTraits)
+def _wire_assert(module: "ModuleType", cls: type, trait: Any, ctx: dict) -> None:
+    """Register the ``assert_stmt`` hook → build an ``AssertTraits`` IR."""
+    cond_field = _strip_field_prefix(trait.cond) or "cond"
+    msg_field: Optional[str] = None
+    if trait.message is not None:
+        msg_field = _strip_field_prefix(trait.message) or "message"
 
-    Identifies the colliding functions by ``__qualname__`` so the user
-    can find both call-sites in the dialect file.
+    def _assert_hook(_parser: Any, cond: Any, msg: Any) -> Any:
+        kwargs: dict[str, Any] = {cond_field: cond}
+        if msg_field is not None:
+            kwargs[msg_field] = msg if (msg is None or isinstance(msg, str)) else str(msg)
+        return cls(**kwargs)
+
+    if not hasattr(module, "assert_stmt"):
+        module.assert_stmt = _assert_hook  # type: ignore[attr-defined]
+
+
+@_wiring_rule(tr.FuncTraits)
+def _wire_func(module: "ModuleType", cls: type, trait: Any, ctx: dict) -> None:
+    """Register the function/class decorator handler.
+
+    Emits a **Category-A frame push** (``Frame(dialects=[module])``)
+    around the body parse — elevates this dialect to the innermost
+    position in the dispatch stack for the duration of the function
+    body. This is the crux of cross-dialect: ``@T.prim_func`` pushes
+    ``T``, ``@R.function`` pushes ``R``, per-function hook lookup
+    resolves accordingly.
+
+    Detection heuristic (function-decorator vs class-decorator):
+    the class-form (``@I.ir_module class M:``) typically has no
+    ``params`` declared in ``region.def_values``; the function-form
+    has ``region.def_values = "$field:params"``. We use that signal.
     """
-    sub = f"[{sub_key!r}]" if sub_key is not None else ""
-    a = getattr(existing.handler, "__qualname__", "<unknown fn>")
-    b = getattr(incoming.handler, "__qualname__", "<unknown fn>")
-    return RuntimeError(
-        f"finalize_module: @parse_hook slot {target}{sub} is claimed by "
-        f"both {a!r} and {b!r}. Each registry slot can carry at most one "
-        "@parse_hook override.",
-    )
+    from tvm_ffi.pyast_trait_parse import parse_func  # noqa: PLC0415
+
+    kind = trait.text_printer_kind
+    parts = _literal_prefix_name(kind)
+    if not parts:
+        return  # Dynamic or missing kind — caller wires manually.
+    _prefix, handler_name = parts
+
+    # Heuristic for class-form: no def_values in region (empty params).
+    is_class_form = trait.region.def_values is None
+
+    body_field = _strip_field_prefix(trait.region.body) or "body"
+    name_field = _strip_field_prefix(trait.symbol) or "name"
+
+    def _func_handler(parser: Any, node: Any) -> Any:
+        with parser.push_frame(pyast.Frame(dialects=[module])):
+            return parse_func(parser, node, cls)
+
+    def _class_handler(parser: Any, node: Any) -> Any:
+        funcs: list = []
+        with parser.push_frame(pyast.Frame(dialects=[module])), \
+                parser.scoped_frame():
+            for stmt in node.body:
+                if isinstance(stmt, pyast.Function):
+                    funcs.append(parser.visit_function(stmt))
+        return cls(**{name_field: node.name.name, body_field: funcs})
+
+    handler = _class_handler if is_class_form else _func_handler
+    if not hasattr(module, handler_name):
+        setattr(module, handler_name, handler)
 
 
-# ---------------------------------------------------------------------------
-# Public entry point
-# ---------------------------------------------------------------------------
+@_wiring_rule(tr.ForTraits)
+def _wire_for(module: "ModuleType", cls: type, trait: Any, ctx: dict) -> None:
+    """Install per-kind iter factories + ``__ffi_range_default__`` +
+    auto-register a default ``$global:`` kind-prefix resolver.
+
+    Post ``design_docs/parser_for_handler_refactor.md``: the per-
+    dialect ``_IterHolder`` dataclass and ``__ffi_for_handler__``
+    protocol are gone. Iter factories return a typed
+    :class:`pyast.ForFrame`; :meth:`IRParser.visit_for` dispatches on
+    ``isinstance(iter_val, ForFrame)`` and builds the IR from
+    ``frame.for_cls``. Silently skips when no ``iter_kinds=[...]``
+    were passed — a dialect can have a ForTraits IR class without
+    source-level sugar factories.
+    """
+    iter_kinds = ctx.get("iter_kinds") or []
+    for kind_name in iter_kinds:
+        if not hasattr(module, kind_name):
+            setattr(module, kind_name, _make_iter_factory(kind_name, cls))
+
+    # First iter kind is the ``range(...)`` fallback default — stored
+    # as ``__ffi_range_default__`` so ``visit_for`` can find it via
+    # ordinary active-dialect lookup.
+    if iter_kinds and not hasattr(module, "__ffi_range_default__"):
+        module.__ffi_range_default__ = getattr(module, iter_kinds[0])
+
+    # Auto-install the printer's ``$global:`` kind-prefix resolver if
+    # the trait references one that's not already registered.
+    _maybe_install_kind_resolver(module, trait, ctx)
 
 
-def finalize_module(
-    module_name: str,
-    prefix: str,
-    *,
-    default_dtypes: dict[type, Any] | None = None,
-    extra_dtypes: tuple[str, ...] | frozenset[str] | None = None,
-    iter_aliases: dict[str, str] | None = None,
-    auto_stub: bool = True,
+def _maybe_install_kind_resolver(
+    module: "ModuleType", trait: Any, ctx: dict,
 ) -> None:
-    """Finalize a dialect module by registering parser-dispatch names.
-
-    Walks ``sys.modules[module_name]`` for ``@py_class`` / ``@c_class``
-    decorated IR types, classifies each into a :class:`Tier`, and installs
-    placeholder dispatch handlers on the module. Honours
-    ``@parse_hook``-decorated module-level functions as explicit
-    overrides. Each FFI class also gets the dialect's printer prefix
-    registered as ``__ffi_print_prefix__`` (so the C++ printer renders
-    ``T.prim_func``, ``R.func`` etc. without a hard-coded prefix). After
-    registration, the dtype handle surface (``T.int32``, …) is installed
-    and an optional sibling ``.pyi`` stub is regenerated.
-
-    Parameters
-    ----------
-    module_name
-        Fully-qualified module name (``__name__`` from the dialect
-        file's last line).
-    prefix
-        The dialect's printer prefix (e.g. ``"T"`` for tir, ``"R"`` for
-        relax). Registered onto every FFI-decorated class in this
-        module via ``__ffi_print_prefix__``; classes that already
-        declare the attribute in their body are left alone.
-    default_dtypes
-        Mapping from Python builtin type (``int``, ``float``, ``bool``)
-        to the dtype name that should accept un-annotated values of
-        that type. The classifier honours these as the dtype that
-        backs ``__ffi_parse_make_const__`` for the corresponding
-        format. Default: ``{int: "int32", float: "float32", bool: "bool"}``.
-    extra_dtypes
-        Extra dtype names to register beyond
-        :data:`DEFAULT_DTYPE_NAMES`. Each name must be parseable as a
-        :class:`tvm_ffi.dtype`.
-    iter_aliases
-        Mapping like ``{"range": "T.serial"}`` — installs ``range`` (or
-        any other Python builtin name) as an alias for an existing
-        registered for-loop kind. Used to make ``for i in range(...)``
-        parse as the dialect's default for-loop kind.
-    auto_stub
-        When ``True`` (default), regenerate the sibling ``.pyi`` stub
-        listing every registered name on this module.
-
-    Raises
-    ------
-    RuntimeError
-        On any duplicate registration (two classes claiming the same
-        slot without an explicit override).
-    KeyError
-        If ``module_name`` is not in ``sys.modules`` (the dialect file
-        must have been imported before its own ``finalize_module()``
-        call returns).
-
-    Notes
-    -----
-    Every registered handler is a placeholder raising
-    :class:`NotImplementedError`. This function only addresses **what
-    name to register**, not **what to register**.
-
+    """Auto-register a default ``f"{prefix}.{obj.kind}"`` resolver for
+    a ``$global:`` ``text_printer_kind`` ref when the user didn't
+    supply one. Keeps the IR-trait line verbatim, just removes the
+    boilerplate resolver on every dialect.
     """
-    if module_name not in sys.modules:
-        raise KeyError(
-            f"finalize_module({module_name!r}): module not in sys.modules. "
-            "Call this from the dialect file itself (after all "
-            "@py_class declarations).",
+    ref = getattr(trait, "text_printer_kind", None)
+    if not isinstance(ref, str) or not ref.startswith("$global:"):
+        return
+    global_name = ref[len("$global:"):]
+    from tvm_ffi import get_global_func, register_global_func  # noqa: PLC0415
+
+    if get_global_func(global_name, allow_missing=True) is not None:
+        return  # user-supplied resolver wins
+
+    prefix = ctx.get("prefix", "T")
+
+    def _default_resolver(_printer: Any, obj: Any, _prefix: str = prefix) -> str:
+        return f"{_prefix}.{obj.kind}"
+
+    register_global_func(global_name)(_default_resolver)
+
+
+@_wiring_rule(tr.WithTraits)
+def _wire_with(module: "ModuleType", cls: type, trait: Any, ctx: dict) -> None:
+    """Register ``__ffi_with_handler__`` on the ctx-marker class + a
+    ``with_stmt`` fallback hook on the module.
+
+    Emits a **Category-C frame push** (``WithFrame()``) inside the
+    auto-generated handler. Requires either:
+
+    * a user-provided marker class registered via ``with_marker=...``
+      on :func:`finalize_module` — the handler is attached to it, OR
+    * a literal ``text_printer_kind`` (e.g. ``"T.block"``) — an
+      auto-generated marker class is created and a factory registered
+      on the module.
+
+    Skips when neither condition is met (e.g. ``no_frame=True`` SeqStmt
+    fixtures which are inherently lossy on roundtrip).
+    """
+    body_field = _strip_field_prefix(trait.region.body) or "body"
+    parts = _literal_prefix_name(trait.text_printer_kind)
+    # SeqStmt-like: no_frame=True — transparent, no handler.
+    if getattr(trait, "text_printer_no_frame", False):
+        return
+
+    marker_cls = ctx.get("with_marker")
+    factory_name = parts[1] if parts else None
+
+    # If no user-provided marker and no literal kind, skip.
+    if marker_cls is None and factory_name is None:
+        return
+
+    def _make_handler(_cls: type = cls) -> Callable:
+        def _handler(self_marker: Any, parser: Any, node: Any) -> Any:
+            with parser.scoped_frame(), parser.push_frame(pyast.WithFrame()):
+                body = parser.visit_body(node.body)
+            return _cls(**{body_field: body})
+
+        return _handler
+
+    # Case 1: user supplied a marker class via ``with_marker=``.
+    # Auto-install the handler only if the user didn't set one already.
+    if marker_cls is not None and not hasattr(marker_cls, "__ffi_with_handler__"):
+        marker_cls.__ffi_with_handler__ = _make_handler()
+
+    # Case 2: literal kind → register the ``<name>()`` factory on the
+    # module. When the user supplied a marker class, the factory must
+    # return an instance of *that* class so its (possibly user-provided)
+    # ``__ffi_with_handler__`` runs. Fall back to a synthetic class only
+    # when no marker class was given.
+    if factory_name is not None:
+        if marker_cls is not None:
+            target_cls = marker_cls
+        else:
+            target_cls = type(f"_{_cls_name_safe(cls)}Marker", (), {})
+            target_cls.__ffi_with_handler__ = _make_handler()
+
+        def _ctx_factory(_mcls: type = target_cls) -> Any:
+            return _mcls()
+
+        _ctx_factory.__name__ = factory_name
+        if not hasattr(module, factory_name):
+            setattr(module, factory_name, _ctx_factory)
+
+
+@_wiring_rule(tr.CallTraits)
+def _wire_call(module: "ModuleType", cls: type, trait: Any, ctx: dict) -> None:
+    """Record the CallTraits class in ``ctx`` for the end-of-finalize
+    ``__getattr__`` install.
+
+    Only registers a fallback when the trait carries a ``$field:`` callee
+    (generic ``<prefix>.<name>(args)`` shape). A literal callee
+    (e.g. ``"R.call_tir"`` on :class:`CallTIR`) means the class is
+    a fixed-shape op — not a generic catch-all — so it's skipped.
+
+    The actual install happens in :func:`finalize_module` after every
+    other rule has run — installing it earlier would shadow ``hasattr``
+    checks in downstream rules (``hasattr(module, "prim_func")`` etc.)
+    and cause them to skip their ``setattr`` registrations.
+    """
+    callee_field = _strip_field_prefix(trait.op)
+    if callee_field is None:
+        return  # Literal callee — fixed-shape op, no opaque fallback.
+    ctx["_call_fallback_cls"] = cls
+    ctx["_call_fallback_callee_field"] = callee_field
+    ctx["_call_fallback_args_field"] = (
+        _strip_field_prefix(trait.args) or "args"
+    )
+
+
+# NOTE: LiteralTraits / PrimTyTraits / ValueTraits /
+# BufferTyTraits / TensorTyTraits are intentionally NOT in the auto-wiring
+# table — they describe IR types the user already reaches via the class
+# name (e.g. ``module.Add``). There's nothing to wire beyond the class
+# registration that ``@py_class`` already handles.
+
+
+# ============================================================================
+# Helpers used by wiring rules
+# ============================================================================
+
+
+def _class_field_names(cls: type) -> set[str]:
+    """Return the declared field names on a py_class IR class."""
+    info = getattr(cls, "__tvm_ffi_type_info__", None)
+    if info is None:
+        return set()
+    # Attribute access on the instance works; fall back to annotations.
+    ann = getattr(cls, "__annotations__", {})
+    return set(ann.keys())
+
+
+def _cls_name_safe(cls: type) -> str:
+    """Make a type-name string safe for use as a synthetic class name."""
+    return "".join(c if c.isalnum() else "_" for c in cls.__name__)
+
+
+def _make_iter_factory(kind: str, for_cls: type) -> Callable:
+    """Build a ``T.<kind>(lb, ub, step, annotations=...)`` factory that
+    returns a typed :class:`~tvm_ffi.pyast.ForFrame`.
+
+    ``loop_var_ty`` comes from ``for_cls._loop_var_ty`` when the IR
+    class declares it (e.g. ``ScfForOp._loop_var_ty = IntegerType("index")``);
+    otherwise left :data:`None` and ``visit_for`` falls back to the
+    ambient ``__ffi_default_int_ty__`` hook.
+    """
+
+    def factory(
+        *args: Any, step: Any = None, annotations: Any = None,
+    ) -> "pyast.ForFrame":
+        if len(args) == 1:
+            start_v, end_v = 0, args[0]
+        elif len(args) == 2:
+            start_v, end_v = args
+        elif len(args) == 3:
+            start_v, end_v, step_pos = args
+            if step is not None and step != step_pos:
+                raise TypeError(f"{kind}: positional and kw step disagree")
+            step = step_pos
+        else:
+            raise TypeError(
+                f"{kind}: expected 1/2/3 positional args, got {len(args)}",
+            )
+        return pyast.ForFrame(
+            for_cls=for_cls,
+            kind=kind,
+            start=start_v,
+            end=end_v,
+            step=1 if step is None else step,
+            annotations=annotations,
+            loop_var_ty=getattr(for_cls, "_loop_var_ty", None),
         )
-    module = sys.modules[module_name]
 
-    registry = _Registry()
-
-    # -- 1. printer prefix on every FFI-decorated class --
-    # Walk the same set the rest of finalize_module operates on, but
-    # filter additionally on ``__ffi_print_prefix__`` already present in
-    # ``cls.__dict__`` so an explicit per-class override stays intact.
-    for cls in _iter_dataclasses(module):
-        if "__ffi_print_prefix__" in cls.__dict__:
-            continue
-        _register_print_prefix(cls, prefix)
-
-    # -- 2. user @parse_hook overrides at module scope come first --
-    user_overrides = _collect_module_hooks(module)
-    for entry in user_overrides:
-        registry.add(entry, override=True)
-
-    # -- 3. classify every IR class in the module --
-    for cls in _iter_dataclasses(module):
-        # The registry silently honours any user overrides already
-        # added; classifier entries that collide raise.
-        for entry in _classify(cls):
-            registry.add(entry)
-
-    # -- 4. install bindings on the module --
-    _install_bindings(module, registry)
-
-    # -- 5. dtype handles + default-range alias --
-    _install_dtype_handles(module, extra_dtypes or ())
-    _install_iter_aliases(module, iter_aliases or {})
-    _install_default_dtypes(module, default_dtypes)
-
-    # -- 6. parse-slot inverses on tier-2 classes --
-    _attach_parse_slots(module)
-
-    # -- 6. optional .pyi regeneration --
-    if auto_stub:
-        # Local import to break the cycle: dialect_stubgen imports
-        # _DtypeHandle / DEFAULT_DTYPE_NAMES from this module.
-        from .stub.dialect_stubgen import write_dialect_stub  # noqa: PLC0415
-
-        write_dialect_stub(module)
+    factory.__name__ = kind
+    return factory
 
 
-# ---------------------------------------------------------------------------
-# Module walking
-# ---------------------------------------------------------------------------
+# ============================================================================
+# Parse-hook wiring (``__ffi_parse_hooks__``)
+# See design_docs/parser_frame_hooks.md §4.5.
+# ============================================================================
 
 
-def _iter_dataclasses(module: Any) -> list[type]:
-    """Return every ``@py_class`` / ``@c_class``-decorated type owned by ``module``.
+def _wire_parse_hooks(module: "ModuleType", cls: type) -> None:
+    """Install each ``cls.__ffi_parse_hooks__`` entry as a module attribute.
 
-    Foreign re-exports (classes whose ``__module__`` is different from
-    the target) are skipped — only types declared in this dialect.
-    The own-``__dict__`` check on ``__tvm_ffi_type_info__`` excludes
-    undecorated subclasses that merely inherit the marker from an FFI
-    base — registering attrs on those would clobber the parent's
-    TypeAttrColumn entry.
+    Keys are the printed names (``"func_attr"``) that
+    :meth:`IRParser.visit_call` resolves via ordinary attribute lookup;
+    values are either a method-name string or a pre-built parse-hook
+    callable. Names already claimed by an earlier wiring rule (e.g. the
+    ``prim_func`` decorator factory set by :func:`_wire_func`) are left
+    alone — the ``hasattr`` guard keeps auto-wiring free of order
+    dependencies.
     """
-    out: list[type] = []
-    target = module.__name__
-    seen: set[int] = set()
-    for value in module.__dict__.values():
-        if not isinstance(value, type):
+    hooks = getattr(cls, "__ffi_parse_hooks__", None)
+    if not hooks:
+        return
+    if not isinstance(hooks, dict):
+        raise TypeError(
+            f"{cls.__module__}.{cls.__name__}.__ffi_parse_hooks__ must be "
+            f"a dict, got {type(hooks).__name__}",
+        )
+    for hook_name, target in hooks.items():
+        if hasattr(module, hook_name):
             continue
-        if "__tvm_ffi_type_info__" not in value.__dict__:
-            continue
-        if not getattr(value, "__tvm_ffi_is_dataclass__", False):
-            continue
-        if getattr(value, "__module__", None) != target:
-            continue
-        if id(value) in seen:
-            continue
-        seen.add(id(value))
-        out.append(value)
-    return out
+        fn = _resolve_parse_hook(cls, hook_name, target)
+        setattr(module, hook_name, fn)
 
 
-def _collect_module_hooks(module: Any) -> list[RegEntry]:
-    """Gather entries from every ``@parse_hook``-decorated module-level fn.
+def _resolve_parse_hook(
+    cls: type, hook_name: str, target: Any,
+) -> Callable[..., None]:
+    """Resolve a single ``__ffi_parse_hooks__`` value to its callable.
 
-    Dedupes by function identity: ``@parse_hook(...)`` fns are typically
-    re-installed on the module under each declared name (e.g.
-    ``@parse_hook("serial", "parallel")`` ends up at ``module.serial``,
-    ``module.parallel``, AND its original definition name). Without
-    dedup, a second ``finalize_module`` call would yield the same fn
-    multiple times and trip the override-conflict check.
+    Accepts:
+
+    * a method-name string — the named class attribute (must be a
+      callable or ``@staticmethod``) is tagged with ``__ffi_parse_hook__``
+      and returned;
+    * a callable pre-marked with ``__ffi_parse_hook__ = True`` (produced
+      by :func:`~tvm_ffi.pyast.frame_setter` / :func:`~tvm_ffi.pyast.frame_merger`
+      or written by hand).
+
+    Any other shape raises a clear :class:`TypeError` at decoration
+    time. Missing or non-callable method references raise
+    :class:`RuntimeError`.
     """
-    out: list[RegEntry] = []
-    seen: set[int] = set()
-    for value in module.__dict__.values():
-        spec = get_hook_spec(value)
+    if isinstance(target, str):
+        raw = cls.__dict__.get(target)
+        if raw is None:
+            raise RuntimeError(
+                f"{cls.__name__}.__ffi_parse_hooks__[{hook_name!r}] refs "
+                f"method {target!r} that doesn't exist on the class body",
+            )
+        fn = raw.__func__ if isinstance(raw, staticmethod) else raw
+        if not callable(fn):
+            raise TypeError(
+                f"{cls.__name__}.__ffi_parse_hooks__[{hook_name!r}] refs "
+                f"a non-callable attribute {target!r}",
+            )
+        fn.__ffi_parse_hook__ = True
+        return fn
+
+    if callable(target):
+        if not getattr(target, "__ffi_parse_hook__", False):
+            raise RuntimeError(
+                f"{cls.__name__}.__ffi_parse_hooks__[{hook_name!r}] is a "
+                "callable that isn't marked ``__ffi_parse_hook__=True``. "
+                "Use ``tvm_ffi.pyast.frame_setter`` / ``frame_merger`` or "
+                "set the sentinel explicitly on your custom callable.",
+            )
+        return target
+
+    raise TypeError(
+        f"{cls.__name__}.__ffi_parse_hooks__[{hook_name!r}]: expected a "
+        "method-name string or a marked parse-hook callable, got "
+        f"{type(target).__name__}",
+    )
+
+
+def _wire_module_parse_hooks(module: "ModuleType") -> None:
+    """Install legacy module-scope ``@parse_hook`` declarations.
+
+    Class-level ``__ffi_parse_hooks__`` are the concrete parser's native
+    mechanism. Module-scope ``@parse_hook`` remains useful for explicit
+    dialect names and for older callers, so wire it after the trait rules
+    and preserve the "existing attribute wins" rule.
+    """
+    claims: dict[tuple[str, Any], Callable[..., Any]] = {}
+
+    def _claim(key: tuple[str, Any], fn: Callable[..., Any]) -> bool:
+        prev = claims.get(key)
+        if prev is not None and prev is not fn:
+            raise RuntimeError(
+                f"finalize_module: @parse_hook slot {key[0]} is claimed by both "
+                f"{prev!r} and {fn!r}",
+            )
+        claims[key] = fn
+        return prev is None
+
+    for fn in list(module.__dict__.values()):
+        spec = get_hook_spec(fn)
         if spec is None:
             continue
-        if id(value) in seen:
-            continue
-        seen.add(id(value))
-        out.extend(_entries_from_hook(spec, value, source_class=None))
-    return out
+        for name in spec.named_callees:
+            _claim((name, None), fn)
+            if name not in module.__dict__:
+                setattr(module, name, fn)
+        for slot in spec.fn_slots:
+            _claim((slot, None), fn)
+            if slot not in module.__dict__:
+                setattr(module, slot, fn)
+        if spec.op_kinds:
+            table = getattr(module, "__ffi_parse_op__", None)
+            if table is None:
+                table = {}
+                setattr(module, "__ffi_parse_op__", table)
+            for op_kind in spec.op_kinds:
+                _claim(("__ffi_parse_op__", op_kind), fn)
+                table.setdefault(op_kind, fn)
+        if spec.make_const_formats:
+            table = getattr(module, "__ffi_parse_make_const__", None)
+            if table is None:
+                table = {}
+                setattr(module, "__ffi_parse_make_const__", table)
+            for fmt in spec.make_const_formats:
+                _claim(("__ffi_parse_make_const__", fmt), fn)
+                table.setdefault(fmt, fn)
 
 
-def _entries_from_hook(
-    spec: ParseHookSpec,
-    fn: Callable[..., Any],
-    *,
-    source_class: type | None,
-) -> list[RegEntry]:
-    """Convert a :class:`ParseHookSpec` to a flat list of :class:`RegEntry`."""
-    out: list[RegEntry] = []
-    for name in spec.named_callees:
-        out.append(RegEntry(name, fn, None, source_class))
-    for slot in spec.fn_slots:
-        if slot not in RESERVED_FN_SLOTS:
-            raise ValueError(
-                f"@parse_hook: {slot!r} is not a recognized reserved slot.",
-            )
-        out.append(RegEntry(slot, fn, None, source_class))
-    for op_kind in spec.op_kinds:
-        out.append(RegEntry(_OP_SLOT, fn, op_kind, source_class))
-    for fmt in spec.make_const_formats:
-        out.append(RegEntry(_MAKE_CONST_SLOT, fn, fmt, source_class))
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Installation
-# ---------------------------------------------------------------------------
-
-
-def _install_bindings(module: Any, registry: _Registry) -> None:
-    """Apply every accumulated :class:`RegEntry` as an attribute on ``module``."""
-    # Direct attrs and reserved-fn slots
-    for target, entry in registry.bindings.items():
-        if target in RESERVED_DICT_SLOTS:
-            assert isinstance(entry, dict)
-            sub_dict = {k: v.handler for k, v in entry.items() if v.handler is not None}
-            _set_attr(module, target, sub_dict)
-            continue
-        assert isinstance(entry, RegEntry)
-        if entry.handler is None:
-            continue
-        _set_attr(module, target, entry.handler)
-
-
-def _set_attr(module: Any, name: str, value: Any) -> None:
-    """Set ``module.<name> = value`` only if ``value`` is fresh.
-
-    User code declared on the module always wins — never overwrite.
-    """
-    if hasattr(module, name) and getattr(module, name) is not value:
-        # Already declared by the user (or a prior finalize call).
-        # Skip silently; this is the "user explicit wins" rule.
-        existing = getattr(module, name)
-        # For dict-typed slots, merge new sub-keys into the existing
-        # dict rather than overwriting wholesale.
-        if isinstance(existing, dict) and isinstance(value, dict):
-            for k, v in value.items():
-                existing.setdefault(k, v)
-        return
-    setattr(module, name, value)
-
-
-def _install_dtype_handles(module: Any, extended: tuple[str, ...] | frozenset[str]) -> None:
-    """Install ``module.<dtype>`` handles for every default + extended dtype."""
-    names = list(DEFAULT_DTYPE_NAMES) + [n for n in extended if n not in DEFAULT_DTYPE_NAMES]
-    for name in names:
-        if hasattr(module, name) and not isinstance(getattr(module, name), _DtypeHandle):
-            # User defined it themselves — leave alone.
-            continue
-        try:
-            dt = _dtype.dtype(name)
-        except Exception as exc:
-            raise ValueError(
-                f"finalize_module: cannot construct dtype {name!r}: {exc}",
-            ) from exc
-        handle = _DtypeHandle(dtype=dt, name=name, module=module)
-        setattr(module, name, handle)
-
-
-def _install_iter_aliases(module: Any, mapping: dict[str, str]) -> None:
-    """Install ``range = T.serial`` (or whichever alias the user requested).
-
-    Each entry in ``mapping`` aliases a Python builtin iterator name (key)
-    onto an already-registered for-loop kind (value). The value may be a
-    bare name (``"serial"``) or a dotted form (``"T.serial"``); the
-    dialect prefix is stripped.
-    """
-    for alias_name, target_path in mapping.items():
-        target_name = target_path.rsplit(".", 1)[-1] if "." in target_path else target_path
-        if hasattr(module, alias_name):
-            continue
-        target = getattr(module, target_name, None)
-        if target is None:
-            raise RuntimeError(
-                f"finalize_module: iter_aliases entry {alias_name!r} "
-                f"references unknown name {target_path!r}; finalize the "
-                "module's main classifier first or check the spelling.",
-            )
-        setattr(module, alias_name, target)
-
-
-def _install_default_dtypes(module: Any, mapping: dict[type, Any] | None) -> None:
-    """Stash ``default_dtypes`` mapping on the module for downstream parsers.
-
-    The actual mapping is normalized to ``{"int": "int32", ...}`` and
-    put on ``module.__ffi_parse_default_dtypes__``.
-    """
-    canonical: dict[str, str] = {}
-    for k, v in (mapping or {int: "int32", float: "float32", bool: "bool"}).items():
-        if isinstance(k, type) and isinstance(v, str):
-            canonical[k.__name__] = v
-        elif isinstance(k, type) and isinstance(v, _DtypeHandle):
-            canonical[k.__name__] = v.name
-    if not hasattr(module, "__ffi_parse_default_dtypes__"):
-        setattr(module, "__ffi_parse_default_dtypes__", canonical)
-
-
-def _attach_parse_slots(module: Any) -> None:
-    """Collect ``@parse_slot`` methods on each tier-2 class for later use.
-
-    The slot routines are stored as a dict on the class as
-    ``__ffi_parse_slots__``; the parser PR consumes them when inverting
-    a trait field via $method/$global. This walk only runs for
-    :attr:`Tier.TRAIT` classes — :attr:`Tier.MANUAL` classes manage
-    their own parsing wholesale, and :attr:`Tier.DEFAULT` classes have
-    no field-inverse needs.
-    """
-    for cls in _iter_dataclasses(module):
+def _attach_parse_slots(classes: list[type]) -> None:
+    """Collect ``@parse_slot`` methods on trait classes for compatibility."""
+    for cls in classes:
         if _tier(cls) is not Tier.TRAIT:
             continue
         slots: dict[str, Callable[..., Any]] = {}
@@ -1134,41 +1016,528 @@ def _attach_parse_slots(module: Any) -> None:
                 continue
             if field_name in slots:
                 raise RuntimeError(
-                    f"@parse_slot: {cls.__name__} declares two methods for field {field_name!r}",
+                    f"@parse_slot: {cls.__name__} declares two methods "
+                    f"for field {field_name!r}",
                 )
             slots[field_name] = value
         if slots:
             cls.__ffi_parse_slots__ = slots  # type: ignore[attr-defined]
 
 
-# ---------------------------------------------------------------------------
-# Introspection helpers (used by tests and the stub generator)
-# ---------------------------------------------------------------------------
+# ============================================================================
+# Top-level entry: finalize_module
+# ============================================================================
+
+
+#: Standard ``{literal category → dtype-name}`` defaults consumed when
+#: ``finalize_module(default_dtypes=None)``. Match the naming a dialect
+#: using FFI dtype literals would pick. Pass an explicit
+#: ``default_dtypes={...}`` (custom names) or ``default_dtypes={}`` (no
+#: defaults — bare literals will raise at parse time) to opt out.
+_STANDARD_DEFAULT_DTYPES: dict[str, str] = {
+    "int": "int32",
+    "float": "float32",
+    "bool": "bool",
+}
+
+
+def finalize_module(
+    module_name: str,
+    prefix: Optional[str] = None,
+    *,
+    iter_kinds: Optional[list[str]] = None,
+    dtypes: Optional[list[str]] = None,
+    default_dtypes: Optional[dict[Any, str]] = None,
+    extra_dtypes: Optional[tuple[str, ...] | frozenset[str]] = None,
+    iter_aliases: Optional[dict[str, str]] = None,
+    with_marker: Optional[type] = None,
+    auto_stub: bool = True,
+) -> None:
+    """Scan the module's ``@py_class`` IR classes and auto-inject
+    lang-module attributes derived from ``__ffi_ir_traits__``.
+
+    See ``design_docs/parser_auto_registration.md`` (§4) for the full
+    spec. Called once at module load, at the bottom of the dialect's
+    .py file.
+
+    Parameters
+    ----------
+    module_name
+        Typically ``__name__`` — the dialect module to scan and mutate.
+    prefix
+        Short prefix used when constructing ``__ffi_op_classes__``
+        entries for unary ops (which have no ``text_printer_func_name``).
+        Defaults to the last component of ``module_name`` (e.g.
+        ``"tir"`` from ``"tvm_ffi.testing.mini.tir"``).
+    iter_kinds
+        Iter-kind strings (e.g. ``["serial", "parallel", …]``) to
+        register as ``module.<kind>(lb, ub, step)`` factories. Each
+        returns a typed :class:`~tvm_ffi.pyast.ForFrame` that
+        :meth:`IRParser.visit_for` dispatches on directly.
+    dtypes
+        Dtype names (e.g. ``["int32", "float32"]``). Auto-registered as
+        plain attribute instances on the module via the user-supplied
+        dtype-handle class (if present via ``module._DtypeHandle``) or
+        the :class:`PrimTy` class discovered in the module.
+    default_dtypes
+        Maps literal category → dtype name. Produces
+        ``__ffi_default_{int,float,bool}_ty__`` attrs pointing at the
+        corresponding ``module.<dtype>`` entries.
+    with_marker
+        Optional class used as the runtime value for a custom
+        ``with``-construct — ``__ffi_with_handler__`` will be injected.
+    """
+    from tvm_ffi.parse_dispatch import register_parser  # noqa: PLC0415
+
+    module = sys.modules[module_name]
+    if prefix is None:
+        prefix = module_name.rsplit(".", 1)[-1]
+
+    # Default ``dtypes`` / ``default_dtypes`` — see
+    # ``design_docs/parser_dtype_defaults_refactor.md``. The defaults
+    # kick in only when the module has a :class:`PrimTyTraits` IR class
+    # AND hasn't already wired its own ``__ffi_default_*_ty__``
+    # (dialects with custom vocabulary like mini.mlir.arith set those
+    # manually before calling ``finalize_module``). Pass
+    # ``dtypes=[]`` / ``default_dtypes={}`` to force "no dtype handles"
+    # on a module that does have a PrimTy.
+    has_prim_ty_trait = _find_class_with_trait(module, tr.PrimTyTraits) is not None
+    has_manual_dtype_defaults = any(
+        hasattr(module, f"__ffi_default_{cat}_ty__")
+        for cat in ("int", "float", "bool")
+    )
+    auto_dtypes_ok = has_prim_ty_trait and not has_manual_dtype_defaults
+
+    if dtypes is None:
+        if auto_dtypes_ok:
+            from tvm_ffi._dtype import STANDARD_DTYPE_NAMES  # noqa: PLC0415
+
+            dtypes = list(STANDARD_DTYPE_NAMES)
+        else:
+            dtypes = []
+    if extra_dtypes is not None:
+        dtypes = [*dtypes, *(dt for dt in extra_dtypes if dt not in dtypes)]
+    if default_dtypes is None:
+        default_dtypes = (
+            dict(_STANDARD_DEFAULT_DTYPES) if auto_dtypes_ok else {}
+        )
+    else:
+        default_dtypes = {
+            (key.__name__ if isinstance(key, type) else str(key)): value
+            for key, value in default_dtypes.items()
+        }
+
+    # Discover ALL ``@py_class`` IR classes in the module (or its
+    # subpackages). ``__tvm_ffi_type_info__`` is the attribute py_class
+    # sets on every registered class — it catches Tier-2 (trait) AND
+    # Tier-3 (bare leaf) classes alike. Only ``__ffi_ir_traits__`` is
+    # still used below to pick the trait-specific wiring rule.
+    all_py_classes: list[type] = []
+    ir_classes: list[type] = []
+    for _, cls in inspect.getmembers(module):
+        if not (
+            isinstance(cls, type)
+            and "__tvm_ffi_type_info__" in cls.__dict__
+        ):
+            continue
+        cls_mod = getattr(cls, "__module__", None)
+        if cls_mod is None:
+            continue
+        if cls_mod != module_name and not cls_mod.startswith(module_name + "."):
+            continue
+        all_py_classes.append(cls)
+        if hasattr(cls, "__ffi_ir_traits__"):
+            ir_classes.append(cls)
+
+    # Trait printers require every dialect class to carry a registered
+    # print prefix. Explicit per-class prefixes still win.
+    for cls in all_py_classes:
+        if "__ffi_print_prefix__" not in cls.__dict__:
+            _register_print_prefix(cls, prefix)
+
+    # Register a three-tier parse dispatcher for every py_class.
+    # See design_docs/parser_tier_dispatch.md — the dispatcher checks
+    # Tier 1 (__ffi_text_parse__) → Tier 2 (__ffi_ir_traits__) → Tier 3
+    # (reflection default) at call time. Registration MUST happen before
+    # the trait wiring rules run so those rules can reference the
+    # registered dispatcher (e.g., the assign router routes through it).
+    for cls in all_py_classes:
+        register_parser(module, cls)
+
+    # Per-class wiring context — accumulates state across rules.
+    ctx: dict[str, Any] = {
+        "op_classes_map": {},
+        "iter_kinds": iter_kinds or [],
+        "with_marker": with_marker,
+        "prefix": prefix,
+    }
+
+    # Apply wiring rules.
+    for cls in ir_classes:
+        trait = cls.__ffi_ir_traits__
+        rule = _WIRING_RULES.get(type(trait))
+        if rule is not None:
+            rule(module, cls, trait, ctx)
+
+    # Wire user-declared parse hooks (``__ffi_parse_hooks__``). Runs
+    # after trait rules so factory names like ``prim_func`` installed by
+    # ``_wire_func`` take precedence over any same-named hook key — hook
+    # names are conventionally distinct (``func_attr`` etc.) so this is
+    # a non-issue in practice.
+    for cls in all_py_classes:
+        _wire_parse_hooks(module, cls)
+    _attach_parse_slots(all_py_classes)
+
+    # Mount composite attrs accumulated by wiring rules.
+    if ctx["op_classes_map"] and not hasattr(module, "__ffi_op_classes__"):
+        module.__ffi_op_classes__ = dict(ctx["op_classes_map"])
+
+    # Publish the module's canonical :class:`PrimTy` class (if any)
+    # so :func:`parse_dispatch._normalize_primty_subclass` can
+    # reconstruct a base-class instance from ``_DtypeHandle``-like
+    # subclasses when building IR via Tier-3 default parse.
+    if not hasattr(module, "__ffi_prim_ty__"):
+        prim_ty_cls = _find_class_with_trait(module, tr.PrimTyTraits)
+        if prim_ty_cls is not None:
+            module.__ffi_prim_ty__ = prim_ty_cls  # type: ignore[attr-defined]
+
+    # Install the ``__ffi_assign__`` router AFTER every rule has run —
+    # deferring here lets both bind and store classes accumulate in
+    # ``ctx`` before the router is built (otherwise the first-run
+    # ``hasattr`` guard would lock in the partial router early).
+    _ensure_assign_router(module, ctx)
+
+    # Dtype handles — synthesize a callable PrimTy subclass so each
+    # ``T.<dtype>`` acts both as a type annotation (base PrimTy) and as
+    # a dual-mode factory (``T.int32(42)`` → Imm, ``T.int32()`` /
+    # ``T.int32(var_name="x")`` → Var). A user-supplied
+    # ``module._DtypeHandle`` still wins (escape hatch). See
+    # ``design_docs/parser_dtype_handle_refactor.md``.
+    if dtypes:
+        handle_cls = getattr(module, "_DtypeHandle", None)
+        prim_ty_cls = _find_class_with_trait(module, tr.PrimTyTraits)
+        if handle_cls is None and prim_ty_cls is None:
+            raise RuntimeError(
+                f"{module_name}: ``dtypes=`` requires either a "
+                "``_DtypeHandle`` class (for callable-dtype dialects) "
+                "OR a PrimTy-trait IR class on the module.",
+            )
+        if handle_cls is None:
+            assert prim_ty_cls is not None  # covered by the guard above
+            handle_cls = _make_dtype_handle_class(
+                module, prim_ty_cls, _infer_primty_field_name(prim_ty_cls),
+            )
+            module._DtypeHandle = handle_cls  # type: ignore[attr-defined]
+        field_name = _infer_primty_field_name(handle_cls)
+        for dt in dtypes:
+            if not hasattr(module, dt):
+                setattr(module, dt, handle_cls(**{field_name: dt}))
+
+    if iter_aliases:
+        for alias_name, target_path in iter_aliases.items():
+            target_name = (
+                target_path.rsplit(".", 1)[-1] if "." in target_path else target_path
+            )
+            if hasattr(module, alias_name):
+                continue
+            target = getattr(module, target_name, None)
+            if target is None:
+                raise RuntimeError(
+                    f"{module_name}: iter_aliases entry {alias_name!r} "
+                    f"references unknown name {target_path!r}",
+                )
+            setattr(module, alias_name, target)
+
+    # Default literal-ty hooks.
+    if default_dtypes:
+        for category, dt_name in default_dtypes.items():
+            attr_name = f"__ffi_default_{category}_ty__"
+            if not hasattr(module, attr_name):
+                handle = getattr(module, dt_name, None)
+                if handle is None:
+                    raise RuntimeError(
+                        f"{module_name}: default_dtypes references "
+                        f"{dt_name!r} but the module has no such attribute",
+                    )
+                setattr(module, attr_name, handle)
+
+    # A ``__ffi_make_var__`` default: if the module has a ValueTraits
+    # IR class and no user-assigned hook, wire one.
+    if not hasattr(module, "__ffi_make_var__"):
+        val_cls = _find_class_with_trait(module, tr.ValueTraits)
+        if val_cls is not None:
+            name_field = "name"
+            ty_field: Optional[str] = None
+            trait = val_cls.__ffi_ir_traits__
+            n = _strip_field_prefix(trait.name)
+            if n is not None:
+                name_field = n
+            if trait.ty is not None:
+                t = _strip_field_prefix(trait.ty)
+                if t is not None:
+                    ty_field = t
+
+            # Normalization base: the canonical PrimTy class in this
+            # module. When the parser passes a ``_DtypeHandle`` subclass
+            # instance (from ``T.int32`` attribute lookup), we reconstruct
+            # a fresh instance of the base PrimTy class so py_class's
+            # exact-class structural-eq stays stable across roundtrips.
+            prim_ty_cls = _find_class_with_trait(module, tr.PrimTyTraits)
+            prim_ty_field = (
+                _infer_primty_field_name(prim_ty_cls) if prim_ty_cls else None
+            )
+
+            def _make_var(_parser: Any, name: str, ty: Any,
+                          _cls: type = val_cls,
+                          _nf: str = name_field, _tf: Optional[str] = ty_field,
+                          _pty: Optional[type] = prim_ty_cls,
+                          _pf: Optional[str] = prim_ty_field) -> Any:
+                if (_pty is not None and _pf is not None
+                        and isinstance(ty, _pty) and type(ty) is not _pty):
+                    ty = _pty(**{_pf: getattr(ty, _pf)})
+                kwargs = {_nf: name}
+                if _tf is not None:
+                    kwargs[_tf] = ty
+                return _cls(**kwargs)
+
+            module.__ffi_make_var__ = _make_var  # type: ignore[attr-defined]
+
+    # Install the CallTraits ``__getattr__`` fallback LAST so every
+    # other rule's ``hasattr(module, name)`` check sees the real module
+    # state and not the fallback catch-all. ``__getattr__`` is only
+    # consulted after the module dict lookup fails, so previously-set
+    # attributes (``prim_func``, ``int32``, ``serial`` …) win; only
+    # genuinely-unknown names like ``T.mma`` route to the fallback.
+    #
+    # Names matching parser-protocol hooks are excluded so cross-dialect
+    # ``_lookup_hook("load")`` / ``"bind"`` / ``"if_stmt"`` / … don't
+    # get intercepted by a dialect that doesn't own them and can't fall
+    # through to the dialect that does.
+    call_cls = ctx.get("_call_fallback_cls")
+    if call_cls is not None and "__getattr__" not in module.__dict__:
+        callee_field = ctx["_call_fallback_callee_field"]
+        args_field = ctx["_call_fallback_args_field"]
+
+        def _module_getattr(name: str,
+                            _cls: type = call_cls,
+                            _cf: str = callee_field,
+                            _af: str = args_field,
+                            _prefix: str = prefix) -> Any:
+            if name.startswith("_") or name in _PARSER_HOOK_NAMES:
+                raise AttributeError(name)
+            full_name = f"{_prefix}.{name}"
+
+            def _factory(*args: Any, **kwargs: Any) -> Any:
+                if kwargs:
+                    raise TypeError(
+                        f"{full_name}: opaque call fallback does not accept "
+                        f"keyword arguments (got {list(kwargs)})",
+                    )
+                return _cls(**{
+                    _cf: full_name,
+                    _af: [_wrap_primitive_via_module(a, module) for a in args],
+                })
+
+            _factory.__name__ = full_name
+            return _factory
+
+        module.__getattr__ = _module_getattr  # type: ignore[attr-defined]
+
+    # Auto-regenerate the sibling ``.pyi`` stub when the source ``.py``
+    # is newer (or the stub is missing). Runs last so every other
+    # finalize step has already populated the module. Silently no-ops
+    # in read-only installs; see :func:`_maybe_autowrite_stub`.
+    _wire_module_parse_hooks(module)
+
+    if auto_stub:
+        _maybe_autowrite_stub(module)
+
+
+# Parser-protocol hook names — names the :class:`IRParser` looks up via
+# ``_lookup_hook`` on active dialects. Must NOT be served by the
+# ``__getattr__`` catch-all (that would block cross-dialect fall-through
+# to a dialect that genuinely provides the hook).
+_PARSER_HOOK_NAMES: frozenset[str] = frozenset([
+    "load", "bind", "buffer_store", "if_stmt", "while_stmt", "assert_stmt",
+    "for_stmt", "with_stmt", "ret",
+])
+
+
+# ============================================================================
+# Auto-regen of sibling ``.pyi`` stubs
+# ============================================================================
+
+
+#: Environment variable controlling the ``.pyi`` auto-regeneration
+#: policy at ``finalize_module`` time. Values:
+#:
+#: - ``"auto"`` (default) — write the stub iff it's missing or older
+#:   than the dialect's ``.py`` source.
+#: - ``"always"`` — write unconditionally, ignoring mtimes.
+#: - ``"off"`` / ``"0"`` / ``""`` — never write.
+_STUBGEN_ENV_VAR: str = "TVM_FFI_DIALECT_STUBS"
+_STUBGEN_ENV_OFF: frozenset[str] = frozenset({"off", "0", ""})
+
+
+def _maybe_autowrite_stub(module: "ModuleType") -> None:
+    """Regenerate ``<module>.pyi`` next to the dialect source when stale.
+
+    Auto-regen is opt-on-by-default (``TVM_FFI_DIALECT_STUBS=auto``)
+    with an mtime guard so the fast path on repeat imports is a
+    single ``stat`` call. Any filesystem error (read-only install,
+    cross-fs permission, locked file under CI) is swallowed with a
+    :mod:`warnings` emission so a failing regen can't block parse /
+    print behavior.
+    """
+    import os  # noqa: PLC0415
+
+    policy = os.environ.get(_STUBGEN_ENV_VAR, "auto").lower()
+    if policy in _STUBGEN_ENV_OFF:
+        return
+
+    source_file = getattr(module, "__file__", None)
+    if source_file is None:
+        return
+
+    from pathlib import Path  # noqa: PLC0415
+
+    source_path = Path(source_file)
+    if source_path.suffix != ".py":
+        return  # packages' ``__init__.py`` regen still works;  .pyc / .so do not
+    stub_path = source_path.with_suffix(".pyi")
+
+    if policy != "always" and stub_path.exists():
+        try:
+            if stub_path.stat().st_mtime >= source_path.stat().st_mtime:
+                return  # fresh enough
+        except OSError:
+            return
+
+    try:
+        from tvm_ffi.stub.dialect_stub import write_dialect_stub  # noqa: PLC0415
+
+        write_dialect_stub(module, stub_path)
+    except Exception as exc:  # noqa: BLE001
+        import warnings  # noqa: PLC0415
+
+        warnings.warn(
+            f"tvm-ffi auto-stubgen for {module.__name__!r} failed: "
+            f"{type(exc).__name__}: {exc}. Set "
+            f"``{_STUBGEN_ENV_VAR}=off`` to silence, or run "
+            "``tvm-ffi-stubgen dialects <module>`` manually.",
+            stacklevel=2,
+        )
+
+
+def _find_class_with_trait(module: "ModuleType", trait_cls: type) -> Optional[type]:
+    """Return the first IR class in ``module`` whose
+    ``__ffi_ir_traits__`` is an instance of ``trait_cls``."""
+    for _, cls in inspect.getmembers(module):
+        if not (
+            isinstance(cls, type)
+            and "__tvm_ffi_type_info__" in cls.__dict__
+            and hasattr(cls, "__ffi_ir_traits__")
+        ):
+            continue
+        if isinstance(cls.__ffi_ir_traits__, trait_cls):
+            return cls
+    return None
+
+
+def _infer_primty_field_name(cls: type) -> str:
+    """Infer the dtype-name field on a PrimTy class (e.g. ``"dtype"``
+    for mini.tir, ``"name"`` for mini.mlir's IntegerType)."""
+    trait = getattr(cls, "__ffi_ir_traits__", None)
+    if trait is None:
+        # PrimTyTraits not applied; assume a subclass used for handles.
+        for base in cls.__mro__[1:]:
+            base_trait = getattr(base, "__ffi_ir_traits__", None)
+            if base_trait is not None:
+                trait = base_trait
+                break
+    if trait is None:
+        return "name"
+    if isinstance(trait, tr.PrimTyTraits):
+        field = _strip_field_prefix(trait.dtype)
+        if field is not None:
+            return field
+    return "name"
+
+
+def _make_dtype_handle_class(
+    module: "ModuleType", prim_ty_cls: type, dtype_field: str,
+) -> type:
+    """Synthesize a callable :class:`PrimTy` subclass for ``module``.
+
+    The returned class is a regular Python subclass of ``prim_ty_cls``
+    (it's *not* ``@py_class``-registered — it shares the base's FFI
+    type; the parser normalizes subclass instances back to the base
+    via :func:`~tvm_ffi.parse_dispatch._normalize_primty_subclass`).
+    Its ``__call__`` implements the three-way dispatch documented in
+    ``design_docs/parser_dtype_handle_refactor.md`` §3.1:
+
+    ===========================  =======================================
+    Call shape                   Returns
+    ===========================  =======================================
+    ``handle()``                 ``__ffi_make_var__(parser=None, "_", ty)``
+    ``handle(var_name="x")``     ``__ffi_make_var__(parser=None, "x", ty)``
+    ``handle(value)``            :func:`make_imm_for_dtype` on the module
+    ===========================  =======================================
+
+    Passing both ``value`` and ``var_name`` is a :class:`TypeError` —
+    the ambiguity mirrors the pre-refactor mini-TIR behavior.
+    """
+    from tvm_ffi.pyast_trait_parse import make_imm_for_dtype  # noqa: PLC0415
+
+    def __call__(
+        self: Any, value: Any = None, *, var_name: Optional[str] = None,
+    ) -> Any:
+        if value is not None and var_name is not None:
+            raise TypeError(
+                f"{type(self).__name__}(...): cannot pass both ``value`` "
+                "and ``var_name``. Use ``value=`` for an Imm literal, or "
+                "``var_name=`` to declare a fresh Var.",
+            )
+        if value is not None:
+            return make_imm_for_dtype(module, str(getattr(self, dtype_field)), value)
+        # Zero-arg / var_name-only: build a Var with the inherited type.
+        make_var = getattr(module, "__ffi_make_var__", None)
+        if make_var is None:
+            raise RuntimeError(
+                f"{module.__name__}: no ``__ffi_make_var__`` registered; "
+                f"cannot build a Var from a dtype handle call.",
+            )
+        return make_var(None, var_name if var_name is not None else "_", self)
+
+    cls_name = "_DtypeHandle"
+    return type(cls_name, (prim_ty_cls,), {
+        "__call__": __call__,
+        "__module__": module.__name__,
+        "__doc__": (
+            f"Auto-generated callable ``{prim_ty_cls.__name__}`` handle "
+            f"for {module.__name__}. See "
+            "``design_docs/parser_dtype_handle_refactor.md``."
+        ),
+    })
 
 
 def registered_names(module: Any) -> set[str]:
-    """Return every attribute name installed by :func:`finalize_module`.
-
-    Skips Python-special dunders (``__name__``, ``__doc__``, …) and
-    user-declared classes; keeps only the parser-dispatch surface plus
-    dtype handles plus reserved C0 slots.
-    """
+    """Return the parser-related surface installed on ``module``."""
     out: set[str] = set()
     for name, value in module.__dict__.items():
-        if name.startswith("__") and name.endswith("__"):
-            if name in RESERVED_FN_SLOTS or name in RESERVED_DICT_SLOTS:
-                out.add(name)
-            elif name == "__ffi_parse_default_dtypes__":
-                out.add(name)
-            continue
-        if isinstance(value, _DtypeHandle):
+        if name.startswith("__ffi_"):
             out.add(name)
             continue
-        # Only count placeholder dispatchers we installed.
-        if getattr(value, "__ffi_parse_placeholder__", False):
-            out.add(name)
+        if isinstance(value, type):
             continue
-        # User @parse_hook function lives on the module; count it too.
         if get_hook_spec(value) is not None:
+            out.add(name)
+            continue
+        if callable(value) and getattr(value, "__module__", "").startswith(
+            "tvm_ffi.dialect_autogen",
+        ):
+            out.add(name)
+            continue
+        if type(value).__name__ == "_DtypeHandle":
             out.add(name)
     return out

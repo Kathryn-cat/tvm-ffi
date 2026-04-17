@@ -1888,13 +1888,13 @@ def test_return_printing() -> None:
 
 def test_tensor_ty_traits_dispatched() -> None:
     out = pyast.to_python(_TensorTy(shape="S", dtype="float32", device="cpu"))
-    assert "Toy.Tensor" in out
+    assert "T.Tensor" in out
     assert "testing.tr.TensorTy(" not in out
 
 
 def test_shape_ty_traits_dispatched() -> None:
     out = pyast.to_python(_ShapeTy(dims="D", ndim="2"))
-    assert "Toy.Shape" in out
+    assert "T.Shape" in out
     assert "testing.tr.ShapeTy(" not in out
 
 
@@ -1933,11 +1933,11 @@ def test_buffer_ty_none_dtype_elided() -> None:
 
 
 def test_prim_ty_string_prints_as_type_syntax() -> None:
-    assert pyast.to_python(_PrimTyNodeP6(dtype="int32")) == "Toy.int32"
+    assert pyast.to_python(_PrimTyNodeP6(dtype="int32")) == "T.int32"
 
 
 def test_empty_tuple_type_is_not_none() -> None:
-    assert pyast.to_python(_TupleTyNodeP6(fields=[])) == "Toy.Tuple()"
+    assert pyast.to_python(_TupleTyNodeP6(fields=[])) == "T.Tuple()"
 
 
 def test_missing_prefix_raises_value_error() -> None:
@@ -1949,11 +1949,12 @@ def test_missing_prefix_raises_value_error() -> None:
 
     @py_class("testing.tr.MissingPrefixBackstop")
     class _MissingPrefix(Object):
-        __ffi_ir_traits__ = tr.PrimTyTraits("$field:dtype")
-        dtype: str
+        __ffi_ir_traits__ = tr.BinOpTraits("$field:lhs", "$field:rhs", "custom", None, None)
+        lhs: Any
+        rhs: Any
 
     with pytest.raises(ValueError, match="__ffi_print_prefix__"):
-        pyast.to_python(_MissingPrefix(dtype="int32"))
+        pyast.to_python(_MissingPrefix(lhs=TraitToyVar(name="a"), rhs=TraitToyVar(name="b")))
 
 
 # ============================================================================
@@ -2226,6 +2227,473 @@ def test_raw_irprinter_does_not_leak_names_across_calls() -> None:
     p = IRPrinter()
     assert p(TraitToyVar(name="x"), AccessPath.root()).to_python() == "x"
     assert p(TraitToyVar(name="x"), AccessPath.root()).to_python() == "x"
+
+
+# ============================================================================
+# Round-trip: every IR printed by a trait must parse back identically.
+# ============================================================================
+
+
+from tvm_ffi import structural_equal as _structural_equal  # noqa: E402
+from tvm_ffi.pyast_trait_parse import parse_func as _parse_func  # noqa: E402
+from tvm_ffi.structural import get_first_structural_mismatch as _first_mismatch  # noqa: E402
+from tvm_ffi.testing.testing import (  # noqa: E402
+    TraitToyPrimTy,
+    TraitToyScalarLoad,
+    TraitToyScalarStore,
+)
+
+
+# ---- Op symbol → TraitToy BinOp class ----
+_BINOP_CLS: dict[str, type] = {
+    "+": TraitToyAdd,
+    "-": TraitToySub,
+    "*": TraitToyMul,
+    "/": TraitToyDiv,
+    "//": TraitToyFloorDiv,
+    "%": TraitToyMod,
+    "**": TraitToyPow,
+    "<<": TraitToyLShift,
+    ">>": TraitToyRShift,
+    "&": TraitToyBitAnd,
+    "|": TraitToyBitOr,
+    "^": TraitToyBitXor,
+    "<": TraitToyLt,
+    "<=": TraitToyLtE,
+    "==": TraitToyEq,
+    "!=": TraitToyNotEq,
+    ">": TraitToyGt,
+    ">=": TraitToyGtE,
+    "and": TraitToyAnd,
+    "or": TraitToyOr,
+}
+
+_UNOP_CLS: dict[str, type] = {
+    "-": TraitToyNeg,
+    "~": TraitToyInvert,
+    "not": TraitToyNot,
+}
+
+
+# ---- Dispatchable language modules ----
+
+
+class _TLang:
+    """Language module exposing every factory / hook needed to round-trip
+    the TraitToy IR zoo.
+    """
+
+    # ---- Type factories ----
+    @staticmethod
+    def int32() -> TraitToyPrimTy:
+        return TraitToyPrimTy(dtype="int32")
+
+    @staticmethod
+    def float32() -> TraitToyPrimTy:
+        return TraitToyPrimTy(dtype="float32")
+
+    @staticmethod
+    def int64() -> TraitToyPrimTy:
+        return TraitToyPrimTy(dtype="int64")
+
+    # ---- ``launch`` context expr (WithTraits, kind="launch") ----
+    @staticmethod
+    def launch() -> None:
+        return None
+
+    @staticmethod
+    def __ffi_make_var__(parser: pyast.IRParser, name: str, ty: Any) -> Any:
+        if callable(ty) and not isinstance(ty, Object):
+            ty = ty()
+        return _var_factory(name, ty)
+
+    @staticmethod
+    def __ffi_assign__(parser: pyast.IRParser, node: pyast.Assign) -> Any:
+        if isinstance(node.lhs, pyast.Index):
+            target = parser.eval_expr(node.lhs.obj)
+            indices = [parser.eval_expr(i) for i in node.lhs.idx]
+            value = parser.eval_expr(node.rhs) if node.rhs is not None else None
+            return _TLang.buffer_store(parser, target, indices, value)
+
+        if not isinstance(node.lhs, pyast.Id):
+            raise NotImplementedError(
+                f"Toy assign: unsupported lhs {type(node.lhs).__name__}",
+            )
+
+        ty = parser.eval_expr(node.annotation) if node.annotation is not None else None
+        var = _TLang.__ffi_make_var__(parser, node.lhs.name, ty)
+        parser.define(node.lhs.name, var)
+        rhs = parser.eval_expr(node.rhs) if node.rhs is not None else None
+        return _TLang.bind(parser, var, rhs)
+
+    # ---- Operator hooks ----
+    @staticmethod
+    def binop(parser: pyast.IRParser, op: str, a: Any, b: Any) -> Any:
+        cls = _BINOP_CLS.get(op)
+        if cls is None:
+            raise NotImplementedError(f"binop: unsupported op {op!r}")
+        return cls(lhs=a, rhs=b)
+
+    @staticmethod
+    def unaryop(parser: pyast.IRParser, op: str, x: Any) -> Any:
+        cls = _UNOP_CLS.get(op)
+        if cls is None:
+            raise NotImplementedError(f"unaryop: unsupported op {op!r}")
+        return cls(x=x)
+
+    @staticmethod
+    def load(parser: pyast.IRParser, buf: Any, indices: list) -> Any:
+        # Scalar vs indexed: indexless is a rare case, mostly print via
+        # ``obj[()]``, so we default to the indexed variant.
+        return TraitToyLoad(buf=buf, indices=indices)
+
+    # ---- Assign / Store / Return / Assert ----
+    @staticmethod
+    def bind(parser: pyast.IRParser, var: Any, rhs: Any) -> Any:
+        if isinstance(var, TraitToyTypedVar):
+            return TraitToyTypedAssign(target=var, value=rhs)
+        return TraitToyAssign(target=var, value=rhs)
+
+    @staticmethod
+    def buffer_store(parser: pyast.IRParser, target: Any, indices: list, value: Any) -> Any:
+        if indices:
+            return TraitToyStore(buf=target, val=value, indices=indices)
+        return TraitToyScalarStore(buf=target, val=value)
+
+    @staticmethod
+    def ret(parser: pyast.IRParser, value: Any) -> Any:
+        return TraitToyReturnNode(val=value)
+
+    @staticmethod
+    def assert_stmt(parser: pyast.IRParser, cond: Any, msg: Any) -> Any:
+        return TraitToyAssertNode(cond=cond, msg=msg)
+
+    # ---- Control flow ----
+    @staticmethod
+    def if_stmt(
+        parser: pyast.IRParser,
+        cond: Any,
+        then_body: list,
+        else_body: list,
+    ) -> Any:
+        if else_body:
+            return TraitToyIfElseNode(cond=cond, then_body=then_body, else_body=else_body)
+        return TraitToyIfNode(cond=cond, then_body=then_body)
+
+    @staticmethod
+    def while_stmt(parser: pyast.IRParser, cond: Any, body: list) -> Any:
+        return TraitToyWhileNode(cond=cond, body=body)
+
+    @staticmethod
+    def for_stmt(parser: pyast.IRParser, node: pyast.For, iter_val: Any) -> Any:
+        if not isinstance(node.lhs, pyast.Id):
+            raise NotImplementedError
+        parser.push_scope()
+        try:
+            loop_var = TraitToyVar(name=node.lhs.name)
+            parser.define(node.lhs.name, loop_var)
+            body = parser.visit_body(node.body)
+        finally:
+            parser.pop_scope()
+        # ``TraitToyForNode`` uses single ``extent``; ``TraitToyForRangeNode``
+        # uses start/end/step. Dispatch by whether start was explicit.
+        if isinstance(iter_val, dict):
+            if "start" in iter_val and iter_val.get("start") not in (0, None):
+                return TraitToyForRangeNode(
+                    loop_var=loop_var,
+                    start=iter_val.get("start", 0),
+                    end=iter_val.get("end", 0),
+                    step=iter_val.get("step", 1),
+                    body=body,
+                )
+            return TraitToyForNode(
+                loop_var=loop_var,
+                extent=iter_val.get("end", 0),
+                body=body,
+            )
+        raise NotImplementedError(f"for_stmt: unexpected iter_val {iter_val!r}")
+
+    @staticmethod
+    def with_stmt(
+        parser: pyast.IRParser,
+        node: pyast.With,
+        ctx: Any,
+    ) -> Any:
+        parser.push_scope()
+        try:
+            as_name = node.lhs.name if isinstance(node.lhs, pyast.Id) else "_ctx"
+            as_var = TraitToyVar(name=as_name)
+            parser.define(as_name, as_var)
+            body = parser.visit_body(node.body)
+        finally:
+            parser.pop_scope()
+        return TraitToyWithNode(as_var=as_var, body=body)
+
+    # ---- Function-form decorators ----
+    @staticmethod
+    def prim_func(parser: pyast.IRParser, node: pyast.Function) -> Any:
+        return _parse_func(parser, node, TraitToyDecoratedFunc)
+
+
+class _ILang:
+    @staticmethod
+    def ir_module(parser: pyast.IRParser, node: pyast.Function) -> Any:
+        return _parse_func(parser, node, TraitToyDecoratedModule)
+
+
+def _toy_binop_parser(op: str) -> Any:
+    def _parse(parser: pyast.IRParser, node: pyast.Operation) -> Any:
+        result = parser.eval_expr(node.operands[0])
+        for operand in node.operands[1:]:
+            result = _TLang.binop(parser, op, result, parser.eval_expr(operand))
+        return result
+
+    _parse.__name__ = f"_toy_parse_{op}"
+    return _parse
+
+
+def _toy_unary_parser(op: str) -> Any:
+    def _parse(parser: pyast.IRParser, node: pyast.Operation) -> Any:
+        return _TLang.unaryop(parser, op, parser.eval_expr(node.operands[0]))
+
+    _parse.__name__ = f"_toy_parse_{op}"
+    return _parse
+
+
+_TLang.__ffi_op_classes__ = {
+    pyast.OperationKind.Add: _toy_binop_parser("+"),
+    pyast.OperationKind.Sub: _toy_binop_parser("-"),
+    pyast.OperationKind.Mult: _toy_binop_parser("*"),
+    pyast.OperationKind.Div: _toy_binop_parser("/"),
+    pyast.OperationKind.FloorDiv: _toy_binop_parser("//"),
+    pyast.OperationKind.Mod: _toy_binop_parser("%"),
+    pyast.OperationKind.Pow: _toy_binop_parser("**"),
+    pyast.OperationKind.LShift: _toy_binop_parser("<<"),
+    pyast.OperationKind.RShift: _toy_binop_parser(">>"),
+    pyast.OperationKind.BitAnd: _toy_binop_parser("&"),
+    pyast.OperationKind.BitOr: _toy_binop_parser("|"),
+    pyast.OperationKind.BitXor: _toy_binop_parser("^"),
+    pyast.OperationKind.Lt: _toy_binop_parser("<"),
+    pyast.OperationKind.LtE: _toy_binop_parser("<="),
+    pyast.OperationKind.Eq: _toy_binop_parser("=="),
+    pyast.OperationKind.NotEq: _toy_binop_parser("!="),
+    pyast.OperationKind.Gt: _toy_binop_parser(">"),
+    pyast.OperationKind.GtE: _toy_binop_parser(">="),
+    pyast.OperationKind.And: _toy_binop_parser("and"),
+    pyast.OperationKind.Or: _toy_binop_parser("or"),
+    pyast.OperationKind.USub: _toy_unary_parser("-"),
+    pyast.OperationKind.Invert: _toy_unary_parser("~"),
+    pyast.OperationKind.Not: _toy_unary_parser("not"),
+}
+
+
+_ROUNDTRIP_LANG = {
+    "T": _TLang(),
+    "I": _ILang(),
+    "prim_func": _TLang.prim_func,
+    "ir_module": _ILang.ir_module,
+}
+
+
+def _var_factory(name: str, ty: Any) -> Any:
+    """Produce the right TraitToy var given an annotation type."""
+    if ty is None:
+        return TraitToyVar(name=name)
+    if isinstance(ty, str):
+        return TraitToyTypedVar(name=name, ty=ty)
+    if isinstance(ty, TraitToyPrimTy):
+        return TraitToyTypedVar(name=name, ty=ty.dtype)
+    if isinstance(ty, TraitToyVar):
+        return TraitToyVar(name=name)
+    if isinstance(ty, TraitToyTypedVar):
+        return TraitToyTypedVar(name=name, ty=ty.ty)
+    return TraitToyVar(name=name)
+
+
+def assert_roundtrip(ir: Object, lang_modules: dict | None = None) -> Object:
+    """Assert ``ir`` round-trips through print → parse back to a structurally
+    equal IR.
+    """
+    lang = lang_modules if lang_modules is not None else _ROUNDTRIP_LANG
+    text = pyast.to_python(ir)
+    parser = pyast.IRParser(lang_modules=lang, var_factory=_var_factory)
+    try:
+        parsed_list = parser.parse(text)
+    except Exception as exc:  # pylint: disable=broad-except
+        raise AssertionError(
+            f"parse raised {type(exc).__name__}: {exc}\n"
+            f"while parsing:\n{text}",
+        ) from exc
+    assert isinstance(parsed_list, list) and len(parsed_list) == 1, (
+        f"parse produced {parsed_list!r}; expected single-element list"
+    )
+    parsed = parsed_list[0]
+    if not _structural_equal(ir, parsed):
+        mismatch = None
+        try:
+            mismatch = _first_mismatch(ir, parsed)
+        except Exception:  # pylint: disable=broad-except
+            pass
+        raise AssertionError(
+            f"round-trip failed:\n"
+            f"  first mismatch: {mismatch}\n"
+            f"  text:\n{text}\n"
+            f"  parsed reprint:\n{pyast.to_python(parsed)}",
+        )
+    return parsed
+
+
+def _f(stmts, *, ret: Any = None, params=None) -> Any:
+    """Wrap statements in a ``TraitToyDecoratedFunc`` so scope + decorator work."""
+    return TraitToyDecoratedFunc(
+        name="f",
+        params=params if params is not None else [],
+        body=stmts,
+    )
+
+
+# -- A ``TraitToyDecoratedFunc`` doesn't declare ``ret`` in its FuncTraits, so
+#    we use ``TraitToyFuncNode`` when tests need the auto-return emit path. --
+
+
+# ---- Parametrized round-trip smoke tests ----
+
+
+def _build_binop_chain() -> Any:
+    """`@prim_func def f(a, b): c = a + b; d = c - b`."""
+    a = TraitToyVar(name="a")
+    b = TraitToyVar(name="b")
+    c = TraitToyVar(name="c")
+    d = TraitToyVar(name="d")
+    return _f(
+        [
+            TraitToyAssign(target=c, value=TraitToyAdd(lhs=a, rhs=b)),
+            TraitToyAssign(target=d, value=TraitToySub(lhs=c, rhs=b)),
+        ],
+        params=[a, b],
+    )
+
+
+def _build_unary_neg() -> Any:
+    a = TraitToyVar(name="a")
+    b = TraitToyVar(name="b")
+    return _f(
+        [TraitToyAssign(target=b, value=TraitToyNeg(x=a))],
+        params=[a],
+    )
+
+
+def _build_typed_assign() -> Any:
+    a = TraitToyVar(name="a")
+    x = TraitToyTypedVar(name="x", ty="int32")
+    return _f(
+        [TraitToyTypedAssign(target=x, value=a)],
+        params=[a],
+    )
+
+
+def _build_if_else() -> Any:
+    a = TraitToyVar(name="a")
+    b = TraitToyVar(name="b")
+    c = TraitToyVar(name="c")
+    d = TraitToyVar(name="d")
+    return _f(
+        [
+            TraitToyIfElseNode(
+                cond=TraitToyGt(lhs=a, rhs=b),
+                then_body=[TraitToyAssign(target=c, value=a)],
+                else_body=[TraitToyAssign(target=d, value=b)],
+            ),
+        ],
+        params=[a, b],
+    )
+
+
+def _build_if_only() -> Any:
+    a = TraitToyVar(name="a")
+    b = TraitToyVar(name="b")
+    c = TraitToyVar(name="c")
+    return _f(
+        [
+            TraitToyIfNode(
+                cond=TraitToyGt(lhs=a, rhs=b),
+                then_body=[TraitToyAssign(target=c, value=a)],
+            ),
+        ],
+        params=[a, b],
+    )
+
+
+def _build_while() -> Any:
+    a = TraitToyVar(name="a")
+    b = TraitToyVar(name="b")
+    c = TraitToyVar(name="c")
+    return _f(
+        [
+            TraitToyWhileNode(
+                cond=TraitToyGt(lhs=a, rhs=b),
+                body=[TraitToyAssign(target=c, value=a)],
+            ),
+        ],
+        params=[a, b],
+    )
+
+
+def _build_assert() -> Any:
+    a = TraitToyVar(name="a")
+    b = TraitToyVar(name="b")
+    c = TraitToyVar(name="c")
+    return _f(
+        [
+            TraitToyAssertNode(cond=TraitToyGt(lhs=a, rhs=b), msg="a must exceed b"),
+            TraitToyAssign(target=c, value=a),
+        ],
+        params=[a, b],
+    )
+
+
+def _build_return() -> Any:
+    a = TraitToyVar(name="a")
+    return _f([TraitToyReturnNode(val=a)], params=[a])
+
+
+def _build_buf_store() -> Any:
+    a = TraitToyVar(name="A")
+    idx = TraitToyVar(name="i")
+    return _f(
+        [TraitToyStore(buf=a, val=idx, indices=[idx])],
+        params=[a, idx],
+    )
+
+
+def _build_load() -> Any:
+    a = TraitToyVar(name="A")
+    i = TraitToyVar(name="i")
+    x = TraitToyVar(name="x")
+    return _f(
+        [TraitToyAssign(target=x, value=TraitToyLoad(buf=a, indices=[i]))],
+        params=[a, i],
+    )
+
+
+_ROUNDTRIP_BUILDERS = [
+    ("binop_chain",       _build_binop_chain),
+    ("unary_neg",         _build_unary_neg),
+    ("typed_assign",      _build_typed_assign),
+    ("if_else",           _build_if_else),
+    ("if_only",           _build_if_only),
+    ("while_loop",        _build_while),
+    ("assert_with_body",  _build_assert),
+    ("return_value",      _build_return),
+    ("buffer_store",      _build_buf_store),
+    ("buffer_load",       _build_load),
+]
+
+
+@pytest.mark.parametrize("name,builder", _ROUNDTRIP_BUILDERS, ids=[n for n, _ in _ROUNDTRIP_BUILDERS])
+def test_trait_roundtrip(name: str, builder: Any) -> None:
+    """For each builder, `pyast.to_python(ir)` → `parse` → `structural_equal(ir, parsed)`."""
+    assert_roundtrip(builder())
 
 
 # ============================================================================

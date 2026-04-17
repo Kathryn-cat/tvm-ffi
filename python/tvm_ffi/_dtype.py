@@ -351,3 +351,19 @@ float8_e8m0fnu = dtype("float8_e8m0fnu")
 float4_e2m1fnx2 = dtype("float4_e2m1fnx2")
 # alias for torch naming pattern for f4x2
 float4_e2m1fn_x2 = float4_e2m1fnx2
+
+#: Canonical list of standard FFI dtype names, mirroring the module-level
+#: literals above. Consumed by
+#: :func:`tvm_ffi.dialect_autogen.finalize_module` as the default value
+#: for its ``dtypes=`` kwarg so dialects that use FFI naming write no
+#: dtype boilerplate. New FFI dtypes get picked up by every dialect
+#: automatically once they're added here.
+STANDARD_DTYPE_NAMES: tuple[str, ...] = (
+    "bool",
+    "int8", "int16", "int32", "int64",
+    "uint8", "uint16", "uint32", "uint64",
+    "float16", "float32", "float64", "bfloat16",
+    "float8_e4m3fn", "float8_e4m3fnuz", "float8_e5m2",
+    "float8_e5m2fnuz", "float8_e8m0fnu",
+    "float4_e2m1fnx2",
+)
