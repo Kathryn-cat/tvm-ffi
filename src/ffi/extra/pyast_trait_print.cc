@@ -497,17 +497,14 @@ NodeAST PrintBinOp(AnyView obj, const tr::BinOpTraits& t, const IRPrinter& print
       return OperationAST(static_cast<int64_t>(it->second), {lhs, rhs});
     }
   }
-  // Non-standard operator or sugar check failed: render as T.FuncName(lhs, rhs)
-  // Use text_printer_func_name if available (e.g. "Add", "FloorDiv"), else fall back to op.
-  std::string_view func_name;
+  std::string_view callee_sv;
   if (t->text_printer_func_name.has_value()) {
-    func_name = {t->text_printer_func_name.value().data(),
+    callee_sv = {t->text_printer_func_name.value().data(),
                  t->text_printer_func_name.value().size()};
   } else {
-    func_name = op_sv;
+    callee_sv = op_sv;
   }
-  ExprAST callee = ExprAttr(IdAST("T"), String(func_name.data(), func_name.size()));
-  return CallAST(callee, {lhs, rhs}, {}, {});
+  return CallAST(ParseCalleeString(callee_sv), {lhs, rhs}, {}, {});
 }
 
 NodeAST PrintUnaryOp(AnyView obj, const tr::UnaryOpTraits& t, const IRPrinter& printer,
