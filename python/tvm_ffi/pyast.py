@@ -45,13 +45,13 @@ if TYPE_CHECKING:
     from collections.abc import MutableMapping, MutableSequence
     from tvm_ffi import Object
     from tvm_ffi.access_path import AccessPath
-    from typing import Any, Callable
+    from typing import Any, Callable, ClassVar
 # isort: on
 # fmt: on
 # tvm-ffi-stubgen(end)
 
 import contextlib
-from collections.abc import Generator, Sequence
+from collections.abc import Generator, Iterator, Sequence
 from typing import Any, TypeVar
 
 from tvm_ffi import Object
@@ -2140,10 +2140,580 @@ def to_python(obj: Any, cfg: PrinterConfig | None = None) -> str:
     return StmtBlock(frame.stmts).to_python(cfg)
 
 
+#: Default set of field names hidden by :func:`dump_ast`.
+#:
+#: These are source-location and commentary fields inherited from
+#: :class:`Node` / :class:`Stmt` that are structurally uninteresting when
+#: debugging parser input shape. Pass a custom ``skip_fields`` to surface
+#: them.
+_DUMP_AST_DEFAULT_SKIP: frozenset[str] = frozenset(
+    {
+        "source_paths",
+        "lineno",
+        "col_offset",
+        "end_lineno",
+        "end_col_offset",
+        "comment",
+    }
+)
+
+
+def dump_ast(  # noqa: PLR0912
+    node: Any,
+    *,
+    indent: int = 0,
+    max_depth: int = 16,
+    file: Any = None,
+    skip_fields: frozenset[str] = _DUMP_AST_DEFAULT_SKIP,
+) -> None:
+    """Recursively print the structure of a pyast :class:`Node` tree.
+
+    Counterpart to ``_dump_ir_node`` in ``step1_all_loops_trace.py`` tuned
+    for tvm-ffi :class:`Node` instances. Uses :func:`iter_fields` (the
+    FFI-reflection-backed field iterator) instead of ad-hoc ``dir()``
+    scraping, so exactly the declared fields are shown — in registration
+    order, inherited fields included.
+
+    Intended for parser debugging: given source text or a :class:`Node`,
+    print the structural shape the :class:`IRParser` is about to consume.
+
+    Output format (example, for ``def func(a: T.int32): b = a + 1``)::
+
+        Function
+          .name =
+            Id
+              .name = 'func'
+          .args = [1]
+              Assign
+                .lhs =
+                  Id
+                    .name = 'a'
+                .annotation =
+                  Attr
+                    .obj =
+                      Id
+                        .name = 'T'
+                    .name = 'int32'
+                .aug_op = 0
+          .body = [1]
+              Assign
+                .lhs =
+                  Id
+                    .name = 'b'
+                .rhs =
+                  Operation
+                    .kind = 0
+                    .operands = [2] ...
+                .aug_op = 0
+
+    Parameters
+    ----------
+    node
+        The pyast :class:`Node` (or a primitive, list, ``None``) to dump.
+        Accepts raw Python source strings via the caller's :func:`from_py`
+        preprocessing — not done here to keep the function pure.
+    indent
+        Current indentation level (used for recursive calls). Callers
+        typically leave this at ``0``.
+    max_depth
+        Stop recursing past this depth; deeper nodes are rendered as
+        ``ClassName ...``. Default ``16`` is deep enough for realistic
+        parser inputs while bounding pathological cases.
+    file
+        Stream to write to. Defaults to :data:`sys.stdout`.
+    skip_fields
+        Field names to omit from the output. Default hides Node's source-
+        location metadata (``source_paths``, ``lineno``, ``col_offset``,
+        ``end_lineno``, ``end_col_offset``) and ``comment``. Pass
+        ``frozenset()`` to surface everything.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        from tvm_ffi import pyast
+
+        src = pyast.from_py("def f(a: int): return a + 1")
+        pyast.dump_ast(src)
+
+    """
+    import sys  # noqa: PLC0415
+
+    if file is None:
+        file = sys.stdout
+    pad = "  " * indent
+
+    # ---- None and scalars ----------------------------------------------------
+    if node is None:
+        print(f"{pad}None", file=file)
+        return
+    if isinstance(node, (int, float, bool, str)):
+        print(f"{pad}{type(node).__name__}({node!r})", file=file)
+        return
+
+    # ---- Depth guard ---------------------------------------------------------
+    if indent >= max_depth:
+        print(f"{pad}{type(node).__name__} ...", file=file)
+        return
+
+    # ---- List / tuple-like top-level containers ------------------------------
+    if isinstance(node, (list, tuple)):
+        items = list(node)
+        if not items:
+            print(f"{pad}[]", file=file)
+            return
+        print(f"{pad}[{len(items)}]", file=file)
+        for item in items:
+            dump_ast(
+                item,
+                indent=indent + 1,
+                max_depth=max_depth,
+                file=file,
+                skip_fields=skip_fields,
+            )
+        return
+
+    # ---- Node (FFI-reflected object) -----------------------------------------
+    if isinstance(node, Node):
+        print(f"{pad}{type(node).__name__}", file=file)
+        for fname, value in iter_fields(node):
+            if fname in skip_fields:
+                continue
+            if value is None:
+                continue
+            if isinstance(value, (int, float, bool, str)):
+                print(f"{pad}  .{fname} = {value!r}", file=file)
+                continue
+            if isinstance(value, Node):
+                print(f"{pad}  .{fname} =", file=file)
+                dump_ast(
+                    value,
+                    indent=indent + 2,
+                    max_depth=max_depth,
+                    file=file,
+                    skip_fields=skip_fields,
+                )
+                continue
+            try:
+                items = list(value)
+            except TypeError:
+                print(f"{pad}  .{fname} = {value!r}", file=file)
+                continue
+            if not items:
+                print(f"{pad}  .{fname} = []", file=file)
+            else:
+                print(f"{pad}  .{fname} = [{len(items)}]", file=file)
+                for item in items:
+                    dump_ast(
+                        item,
+                        indent=indent + 2,
+                        max_depth=max_depth,
+                        file=file,
+                        skip_fields=skip_fields,
+                    )
+        return
+
+    # ---- Fallback: unknown object type ---------------------------------------
+    print(f"{pad}{type(node).__name__}({node!r})", file=file)
+
+
+# ============================================================================
+# IRParser — trait-driven parser (PyAST → IR objects)
+# ============================================================================
+
+
+class IRParser:
+    """Trait-driven IR parser: converts PyAST nodes into IR objects.
+
+    Counterpart to :class:`IRPrinter`, which converts IR objects into PyAST.
+    Uses the same ``__ffi_ir_traits__`` metadata to drive the parse dispatch.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        parser = IRParser()
+        ast_node = pyast.from_py(source_text)
+        ir_obj = parser.parse(ast_node)
+
+    """
+
+    def __init__(
+        self,
+        lang_modules: dict[str, Any] | None = None,
+        *,
+        var_factory: Callable[[str, Any], Any] | None = None,
+    ) -> None:
+        """Construct an :class:`IRParser`.
+
+        Parameters
+        ----------
+        lang_modules
+            The language-module registry — maps identifier strings
+            (``"T"``, …) to Python objects that resolve during
+            ``eval_expr``. Additional parse hooks are discovered on these
+            modules' attributes (see :meth:`_lookup_hook`).
+        var_factory
+            TBD
+        """
+        self._scopes: list[dict[str, Any]] = [{}]
+        self._lang_modules: dict[str, Any] = dict(lang_modules) if lang_modules else {}
+        self.var_factory = var_factory
+
+    def _lookup_hook(self, name: str) -> Any:
+        """Find ``name`` as an attribute on any registered language module."""
+        for mod in self._lang_modules.values():
+            val = getattr(mod, name, None)
+            if val is not None:
+                return val
+        return None
+
+    # ------------------------------------------------------------------
+    # Var-table
+    # ------------------------------------------------------------------
+
+    def push_scope(self) -> None:
+        """Open a new innermost scope."""
+        self._scopes.append({})
+
+    def pop_scope(self) -> None:
+        """Close the innermost scope.
+        Raises :class:`RuntimeError` when only the global scope remains on the stack.
+        """
+        if len(self._scopes) <= 1:
+            raise RuntimeError(
+                "pop_scope called with only the global scope on the stack — "
+                "indicates an unbalanced push/pop pair. Prefer "
+                "IRParser.scoped_frame() to keep them paired automatically.",
+            )
+        self._scopes.pop()
+
+    @contextlib.contextmanager
+    def scoped_frame(self) -> Iterator[None]:
+        """Push a fresh scope for the duration of the ``with`` block."""
+        self.push_scope()
+        try:
+            yield
+        finally:
+            self.pop_scope()
+
+    def define(self, name: str, var: Any) -> None:
+        """Register ``name → var`` in the innermost scope."""
+        innermost = self._scopes[-1]
+        if name in innermost:
+            raise NameError(
+                f"variable {name!r} is already defined in the innermost "
+                f"scope (depth {self.scope_depth - 1}); this is usually a "
+                f"parser bug (duplicate parameter / loop var / bind). "
+                f"Call IRParser.redefine to overwrite intentionally. "
+                f"Active scope chain: {self._format_scope_chain()}",
+            )
+        innermost[name] = var
+
+    def redefine(self, name: str, var: Any) -> None:
+        """Overwrite ``name`` in the innermost scope without checking."""
+        self._scopes[-1][name] = var
+
+    def lookup(self, name: str) -> Any | None:
+        """Resolve ``name`` against the scope chain (innermost first)."""
+        for scope in reversed(self._scopes):
+            if name in scope:
+                return scope[name]
+        return None
+
+    def lookup_required(self, name: str, *, role: str = "variable") -> Any:
+        """Like :meth:`lookup` but raises :class:`NameError` on miss."""
+        val = self.lookup(name)
+        if val is None:
+            raise NameError(
+                f"{role} {name!r} is not defined; active scope chain "
+                f"(innermost first): {self._format_scope_chain()}",
+            )
+        return val
+
+    @property
+    def scope_depth(self) -> int:
+        """Total number of active scopes, including the global one."""
+        return len(self._scopes)
+
+    def _format_scope_chain(self) -> str:
+        """Render the scope chain for inclusion in error messages."""
+        parts: list[str] = []
+        n = len(self._scopes)
+        for offset, scope in enumerate(reversed(self._scopes)):
+            depth = n - 1 - offset
+            keys = ", ".join(sorted(scope.keys())) or ""
+            parts.append(f"depth {depth}: {{{keys}}}")
+        return "[" + "; ".join(parts) + "]"
+
+    # ---- Public entry point ----
+
+    def parse(self, source: str | Node) -> Any:
+        """Parse Python source text or a PyAST node into IR objects.
+
+        Parameters
+        ----------
+        source
+            Either a Python source string (passed through :func:`from_py`
+            first) or a PyAST :class:`Node` directly.
+
+        Returns
+        -------
+        Any
+            The parsed IR object(s).  For a :class:`StmtBlock` input,
+            returns a list of IR objects.
+
+        """
+        if isinstance(source, str):
+            source = from_py(source)
+            import sys
+
+            dump_ast(source, file=sys.stdout)
+        return self.visit(source)
+
+    # ---- Unified dispatch ----
+
+    def visit(self, node: Node) -> Any:
+        """Dispatch a PyAST node to its ``visit_*`` method."""
+        if isinstance(node, StmtBlock):
+            return self.visit_stmt_block(node)
+        if isinstance(node, Function):
+            return self.visit_function(node)
+        if isinstance(node, Assign):
+            return self.visit_assign(node)
+        if isinstance(node, ExprStmt):
+            return self.visit_expr_stmt(node)
+        if isinstance(node, Return):
+            return self.visit_return(node)
+        if isinstance(node, Assert):
+            return self.visit_assert(node)
+        if isinstance(node, If):
+            return self.visit_if(node)
+        if isinstance(node, While):
+            return self.visit_while(node)
+        if isinstance(node, For):
+            return self.visit_for(node)
+        if isinstance(node, With):
+            return self.visit_with(node)
+        if isinstance(node, Id):
+            return self.visit_id(node)
+        raise NotImplementedError(f"visit: unhandled {type(node).__name__}")
+
+    def visit_body(self, stmts: Sequence[Stmt]) -> list[Any]:
+        """Visit a sequence of statements and return their IR objects."""
+        out: list[Any] = []
+        for s in stmts:
+            if isinstance(s, ExprStmt) and isinstance(s.expr, Id) and s.expr.name == "pass":
+                continue
+            out.append(self.visit(s))
+        return out
+
+    def eval_expr(self, node: Expr) -> Any:
+        """Evaluate an expression to a Python value.
+
+        Resolution order for :class:`Id`:
+        1. Local scope (variables registered via :meth:`define`).
+        2. Language-module registry passed at construction.
+        3. :meth:`resolve_module` hook for subclass extension.
+        """
+        if isinstance(node, Literal):
+            return node.value
+        if isinstance(node, Id):
+            var = self.lookup(node.name)
+            if var is not None:
+                return var
+            if node.name in self._lang_modules:
+                return self._lang_modules[node.name]
+            return self.resolve_module(node.name)
+        if isinstance(node, Attr):
+            return getattr(self.eval_expr(node.obj), node.name)
+        if isinstance(node, Operation):
+            return self.visit_operation(node)
+        if isinstance(node, Call):
+            return self.visit_call(node)
+        if isinstance(node, Index):
+            return self.visit_index(node)
+        if isinstance(node, List):
+            return [self.eval_expr(v) for v in node.values]
+        if isinstance(node, Tuple):
+            return tuple(self.eval_expr(v) for v in node.values)
+        raise NotImplementedError(f"eval_expr: unhandled {type(node).__name__}")
+
+    def resolve_module(self, name: str) -> Any:
+        """Subclass hook for resolving identifiers not in scope or lang modules."""
+        raise NameError(f"Unknown identifier: {name!r}")
+
+    # ---- Expression visitors ----
+
+    def visit_id(self, node: Id) -> Any:
+        """Look up a variable by name in the current scope."""
+        var = self.lookup(node.name)
+        if var is not None:
+            return var
+        raise ValueError(f"Undefined variable: {node.name!r}")
+
+    def visit_index(self, node: Index) -> Any:
+        """Evaluate a subscript expression ``obj[indices]``.
+
+        Dispatch order:
+        1. If a language module exposes ``load``, call
+           ``load(parser, obj, indices)``.
+        2. Otherwise invoke ``obj[indices]`` — IR classes like ``Buffer``
+           typically define ``__getitem__`` to build a trait-driven Load.
+        """
+        obj = self.eval_expr(node.obj)
+        indices = [self.eval_expr(i) for i in node.idx]
+        load = self._lookup_hook("load")
+        if load is not None:
+            return load(self, obj, indices)
+        if len(indices) == 1:
+            return obj[indices[0]]
+        return obj[tuple(indices)]
+
+    def visit_call(self, node: Call) -> Any:
+        """Evaluate a call expression by invoking the resolved callee."""
+        callee = self.eval_expr(node.callee)
+        args = [self.eval_expr(a) for a in node.args]
+        kwargs = {
+            k: self.eval_expr(v) for k, v in zip(node.kwargs_keys, node.kwargs_values)
+        }
+        return callee(*args, **kwargs)
+
+    def visit_operation(self, node: Operation) -> Any:
+        """Dispatch a :class:`Operation` via the lang module's ``__ffi_op_classes__`` map.
+        """
+        if node.op == OperationKind.Parens:
+            return self.eval_expr(node.operands[0])
+
+        op_classes = self._lookup_hook("__ffi_op_classes__")
+        if op_classes is None:
+            raise NotImplementedError(
+                "visit_operation: no ``__ffi_op_classes__`` hook on any "
+                "registered language module. Register a "
+                "``{OperationKind.X: '<dotted lang-module path>', ...}`` "
+                "map to enable sugar-form (``a + b``) parsing.",
+            )
+
+        ref = op_classes.get(node.op)
+        if ref is None:
+            raise NotImplementedError(
+                f"visit_operation: ``__ffi_op_classes__`` has no entry for "
+                f"OperationKind kind={node.op}. Add an entry mapping the "
+                f"kind to a dotted lang-module path (e.g. ``'T.Add'``) so "
+                f"the parser can resolve the parse function for this op.",
+            )
+
+        # Resolve the dotted reference
+        parts = ref.split(".")
+        expr: Expr = Id(name=parts[0])
+        for p in parts[1:]:
+            expr = Attr(obj=expr, name=p)
+        parse_fn = self.eval_expr(expr)
+        return parse_fn(self, node)
+
+    def visit_stmt_block(self, node: StmtBlock) -> Any:
+        return self.visit_body(node.stmts)
+
+    def visit_expr_stmt(self, node: ExprStmt) -> Any:
+        return self.eval_expr(node.expr)
+
+    # ---- Statement visitors ----
+
+    def visit_function(self, node: Function) -> Any:
+        """Parse a function definition via decorator-based registry dispatch."""
+        if not node.decorators:
+            raise ValueError(
+                f"Function {node.name.name!r} must be decorated to dispatch parser",
+            )
+        handler = self.eval_expr(node.decorators[-1])
+        if not callable(handler):
+            raise TypeError(
+                f"Decorator did not resolve to a callable parse handler: {handler!r}",
+            )
+        return handler(self, node)
+
+    def visit_return(self, node: Return) -> Any:
+        """Parse a ``return <value>`` stmt."""
+        value = self.eval_expr(node.value) if node.value is not None else None
+        hook = self._lookup_hook("ret")
+        if hook is not None:
+            return hook(self, value)
+        return value
+
+    def visit_if(self, node: If) -> Any:
+        """Parse ``if / else``. Looks up ``if_stmt`` hook on language modules."""
+        cond = self.eval_expr(node.cond)
+        with self.scoped_frame():
+            then_body = self.visit_body(node.then_branch)
+        else_body: list[Any] = []
+        if node.else_branch:
+            with self.scoped_frame():
+                else_body = self.visit_body(node.else_branch)
+        hook = self._lookup_hook("if_stmt")
+        if hook is not None:
+            return hook(self, cond, then_body, else_body)
+        return (cond, then_body, else_body)
+
+    def visit_for(self, node: For) -> Any:
+        """Parse ``for`` loop. Looks up ``for_stmt`` hook on language modules."""
+        iter_val = self.eval_expr(node.rhs)
+        # NOTE: unlike if/while, the loop-var binding happens INSIDE the hook
+        # (needed before visiting body), so we don't pre-visit body here.
+        hook = self._lookup_hook("for_stmt")
+        if hook is not None:
+            return hook(self, node, iter_val)
+        # Default fallback — visit body without binding the loop var.
+        with self.scoped_frame():
+            body = self.visit_body(node.body)
+        return (node.lhs, iter_val, body)
+
+    def visit_with(self, node: With) -> Any:
+        """Parse ``with`` stmt. Looks up ``with_stmt`` hook on language modules."""
+        ctx = self.eval_expr(node.rhs)
+        hook = self._lookup_hook("with_stmt")
+        if hook is not None:
+            return hook(self, node, ctx)
+        with self.scoped_frame():
+            body = self.visit_body(node.body)
+        return (ctx, body)
+
+    def visit_while(self, node: While) -> Any:
+        """Parse ``while`` loop. Looks up ``while_stmt`` hook on language modules."""
+        cond = self.eval_expr(node.cond)
+        with self.scoped_frame():
+            body = self.visit_body(node.body)
+        hook = self._lookup_hook("while_stmt")
+        if hook is not None:
+            return hook(self, cond, body)
+        return (cond, body)
+
+    def visit_assert(self, node: Assert) -> Any:
+        """Parse ``assert cond, msg``. Looks up ``assert_stmt`` hook."""
+        cond = self.eval_expr(node.cond)
+        msg = self.eval_expr(node.msg) if node.msg is not None else None
+        hook = self._lookup_hook("assert_stmt")
+        if hook is not None:
+            return hook(self, cond, msg)
+        return (cond, msg)
+
+    def visit_assign(self, node: Assign) -> Any:
+        """Parse an assignment via the ``__ffi_assign__`` hook."""
+        assign_hook = self._lookup_hook("__ffi_assign__")
+        if assign_hook is None:
+            raise NotImplementedError(
+                "visit_assign: no ``__ffi_assign__`` hook on any registered "
+                "language module. Register one to handle pyast.Assign.",
+            )
+        return assign_hook(self, node)
+
+
+def parse(source: str | Node, lang_modules: dict[str, Any] | None = None) -> Any:
+    """Parse Python source text or a PyAST node into IR objects."""
+    return IRParser(lang_modules=lang_modules).parse(source)
+
+
 # ---------------------------------------------------------------------------
 # Re-export visitor utilities.
-# Placed after all node classes so that `_pyast_visitor` can import `Node`
-# without triggering a circular import (it does so lazily inside methods).
 # ---------------------------------------------------------------------------
 # isort: off
 from tvm_ffi._pyast_visitor import NodeTransformer as NodeTransformer  # noqa: PLC0414

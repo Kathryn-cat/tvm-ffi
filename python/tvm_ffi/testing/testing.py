@@ -1131,6 +1131,15 @@ class TraitToyClassNode(Object):
     body: List[Object]  # noqa: UP006
 
 
+# ---- Type nodes ----
+
+
+@py_class("testing.ir_traits.PrimTy")
+class TraitToyPrimTy(Object):
+    __ffi_ir_traits__ = tr.PrimTyTraits("$field:dtype")
+    dtype: str
+
+
 # A type with NO trait and NO __ffi_text_print__ (for default/Tier 3)
 @py_class("testing.ir_traits.PlainObj")
 class TraitToyPlainObj(Object):
