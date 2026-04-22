@@ -431,6 +431,174 @@ def test_t0_cast_level_zero_print():
 
 
 # ============================================================================
+# Three-tier dispatch — Tier 3 (default parse) tests
+# See design_docs/parser_tier_dispatch.md §8.1–8.4.
+# ============================================================================
+
+
+def test_default_parse_cast_roundtrip():
+    """Leaf ``mt.Cast`` (no trait, no custom) roundtrips via default parse."""
+    orig = mt.Cast(target=mt.PrimTy(dtype="float32"), value=_int(1))
+    func = _wrap([mt.Bind(var=_v("c", "float32"), value=orig)])
+    text = pyast.to_python(func)
+    assert "Cast" in text
+    _rt(func)
+
+
+def test_default_parse_cast_of_binop():
+    """``Cast(target=T.f32, value=a + b)`` — kwarg is a nested IR expression."""
+    a, b = _v("a"), _v("b")
+    outer = mt.Cast(
+        target=mt.PrimTy(dtype="float32"),
+        value=mt.Add(lhs=a, rhs=b),
+    )
+    func = _wrap(
+        [mt.Bind(var=_v("r", "float32"), value=outer)],
+        params=[a, b],
+    )
+    _rt(func)
+
+
+def test_default_parse_cast_nested_deep():
+    """Multiple Cast layers — recursive Tier-3 dispatch is stable."""
+    a = _v("a")
+    outer = mt.Cast(
+        target=mt.PrimTy(dtype="float32"),
+        value=mt.Cast(
+            target=mt.PrimTy(dtype="int64"),
+            value=mt.Cast(
+                target=mt.PrimTy(dtype="int32"),
+                value=a,
+            ),
+        ),
+    )
+    func = _wrap(
+        [mt.Bind(var=_v("r", "float32"), value=outer)],
+        params=[a],
+    )
+    _rt(func)
+
+
+def test_default_parse_leaf_class_roundtrip():
+    """Bare ``@py_class`` leaf class with no trait roundtrips via default parse."""
+    flag = mt.Flag(kind="reduce", count=4)
+    wrapped = mt.Call(op_name="T.tag", args=[flag])
+    func = _wrap([mt.Evaluate(value=wrapped)])
+    _rt(func)
+
+
+# ============================================================================
+# Three-tier dispatch — Tier 1 (custom __ffi_text_parse__) tests
+# See design_docs/parser_tier_dispatch.md §8.5–8.9.
+# ============================================================================
+
+
+def test_custom_parse_fires_when_declared():
+    """``__ffi_text_parse__`` on ``FlagV2`` runs in preference to default parse."""
+    mt.FlagV2._FLAG_V2_CUSTOM_FIRED = False
+    flag = mt.FlagV2(kind="X")
+    wrapped = mt.Call(op_name="T.tag", args=[flag])
+    func = _wrap([mt.Evaluate(value=wrapped)])
+    _rt(func)
+    assert mt.FlagV2._FLAG_V2_CUSTOM_FIRED, (
+        "FlagV2.__ffi_text_parse__ did not fire — Tier 1 dispatch broken"
+    )
+
+
+def test_custom_parse_wins_over_trait_parse():
+    """Adding ``__ffi_text_parse__`` to a trait-bearing class (``mt.Add``)
+    intercepts trait parsing — Tier 1 precedence over Tier 2.
+
+    Uses the de-sugared ``T.Add(1, 2)`` form (two literals defeat the
+    sugar-check gate) so the parser enters ``visit_call`` and routes
+    through the Add dispatcher where Tier 1 can win.
+    """
+    fire_count = {"n": 0}
+
+    def custom_add(cls, parser, node):
+        fire_count["n"] += 1
+        # Node is a pyast.Call with two literal args. Reconstruct
+        # positionally and let ``__ffi_default_int_ty__`` wrap the
+        # literals as IntImm so the roundtrip value structurally
+        # matches the orig.
+        args = [parser._wrap_primitive_ast(parser.eval_expr(a)) for a in node.args]
+        return cls(*args)
+
+    try:
+        mt.Add.__ffi_text_parse__ = classmethod(custom_add)
+
+        func = _wrap(
+            [mt.Bind(var=_v("c"), value=mt.Add(lhs=_int(1), rhs=_int(2)))],
+        )
+        _rt(func)
+        assert fire_count["n"] >= 1, "custom parse did not fire for mt.Add"
+    finally:
+        if "__ffi_text_parse__" in mt.Add.__dict__:
+            delattr(mt.Add, "__ffi_text_parse__")
+
+
+def test_custom_parse_post_decoration_is_picked_up():
+    """``__ffi_text_parse__`` added post-decoration is used on next parse.
+
+    Validates the *lazy* dispatcher semantics from the design doc §3.1
+    — a user adding the hook after the class was registered must take
+    effect immediately without re-running :func:`finalize_module`.
+    The custom parser delegates to :func:`_default_parse` for its data
+    work so normalization (``_DtypeHandle`` → ``PrimTy``, primitive →
+    Imm) still happens; the point of the test is that the custom
+    method *ran*.
+    """
+    from tvm_ffi.parse_dispatch import _default_parse  # noqa: PLC0415
+
+    fired = {"yes": False}
+
+    def custom_parse(cls, parser, node):
+        fired["yes"] = True
+        return _default_parse(parser, node, cls)
+
+    original = mt.Cast.__dict__.get("__ffi_text_parse__")
+    try:
+        mt.Cast.__ffi_text_parse__ = classmethod(custom_parse)
+        orig = mt.Cast(target=mt.PrimTy(dtype="float32"), value=_int(1))
+        func = _wrap([mt.Bind(var=_v("c", "float32"), value=orig)])
+        _rt(func)
+        assert fired["yes"], "Lazy dispatch did not pick up post-hoc custom parse"
+    finally:
+        if original is None:
+            if "__ffi_text_parse__" in mt.Cast.__dict__:
+                delattr(mt.Cast, "__ffi_text_parse__")
+        else:
+            mt.Cast.__ffi_text_parse__ = original
+
+
+def test_dispatcher_marker_on_lang_module_not_class():
+    """IR classes stay pure data — the dispatcher + its marker live on
+    the lang module's ``__ffi_parsers__`` registry."""
+    assert not hasattr(mt.Cast, "__ffi_parse_aware__")
+    assert not hasattr(mt.Cast, "__ffi_parse_dispatch__")
+    assert not hasattr(mt.Add, "__ffi_parse_aware__")
+    assert not hasattr(mt.Add, "__ffi_parse_dispatch__")
+
+    registry = mt.__ffi_parsers__
+    assert getattr(registry["Cast"], "__ffi_parse_aware__", False) is True
+    assert getattr(registry["Add"], "__ffi_parse_aware__", False) is True
+    assert getattr(registry["PrimFunc"], "__ffi_parse_aware__", False) is True
+
+
+def test_default_parse_rejects_non_call_node():
+    """Tier-3 default parse raises a clear error when the node isn't a Call."""
+    from tvm_ffi.parse_dispatch import _default_parse  # noqa: PLC0415
+    import pytest as _pytest  # noqa: PLC0415
+
+    parser = pyast.IRParser(
+        lang_modules=mt.LANG_MODULES, var_factory=mt.make_var_factory,
+    )
+    fake_node = pyast.Id(name="not_a_call")
+    with _pytest.raises(TypeError, match="leaf-only|Tier 1|Tier 2"):
+        _default_parse(parser, fake_node, mt.Cast)
+
+
+# ============================================================================
 # Tier 1 — Simple expressions (one or two children)
 # ============================================================================
 

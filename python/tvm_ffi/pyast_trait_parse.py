@@ -630,62 +630,6 @@ def parse_assert(
     return ir_class(**fields)
 
 
-_TRAIT_TO_PARSE_FN: dict[type, Any] = {
-    tr.FuncTraits: parse_func,
-    tr.AssignTraits: parse_assign,
-    tr.StoreTraits: parse_store,
-    tr.ReturnTraits: parse_return,
-    tr.AssertTraits: parse_assert,
-    tr.IfTraits: parse_if,
-    tr.WhileTraits: parse_while,
-    tr.ForTraits: parse_for,
-    tr.WithTraits: parse_with,
-}
-
-
-def parse_with_dispatch(
-    parser: IRParser,
-    node: Any,
-    ir_class: type,
-    trait: tr.IRTraits | None = None,
-) -> Any:
-    """Parse ``node`` into an instance of ``ir_class``."""
-    # ---- Tier 1: manual override on the class ----
-    custom = getattr(ir_class, "__ffi_text_parse__", None)
-    if callable(custom):
-        return custom(parser, node)
-
-    # ---- Tier 2: trait-driven ----
-    if trait is None:
-        trait = _trait_of(ir_class)
-    if trait is not None:
-        for trait_cls, parse_fn in _TRAIT_TO_PARSE_FN.items():
-            if isinstance(trait, trait_cls):
-                return parse_fn(parser, node, ir_class, trait)
-        raise TypeError(
-            f"parse_with_dispatch: {type(trait).__name__} has no dedicated "
-            f"parser (expression/type traits are constructed via "
-            f"language-module factories, not via this dispatcher)",
-        )
-
-    # ---- Tier 3: default parse ----
-    return _default_parse(parser, node, ir_class)
-
-
-def _default_parse(
-    parser: IRParser,
-    node: Any,
-    ir_class: type,
-) -> Any:
-    """Default parse — inverse of ``DefaultPrint``."""
-    if not isinstance(node, pyast.Call):
-        raise NotImplementedError(
-            f"_default_parse: expected pyast.Call for {ir_class.__name__}, "
-            f"got {type(node).__name__}",
-        )
-    kwargs: dict[str, Any] = {
-        k: parser.eval_expr(v)
-        for k, v in zip(node.kwargs_keys, node.kwargs_values)
-    }
-    args = [parser.eval_expr(a) for a in node.args]
-    return ir_class(*args, **kwargs)
+# Dispatch through three tiers (Tier 1 ``__ffi_text_parse__`` →
+# Tier 2 trait → Tier 3 reflection default) now lives in
+# :mod:`tvm_ffi.parse_dispatch` — see ``design_docs/parser_tier_dispatch.md``.

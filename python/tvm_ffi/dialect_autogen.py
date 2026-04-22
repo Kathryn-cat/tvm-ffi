@@ -354,13 +354,32 @@ def _ensure_assign_router(module: "ModuleType", ctx: dict) -> None:
                 _store: Optional[type] = store_cls,
                 _bind: Optional[type] = bind_cls,
                 _this_module: "ModuleType" = module) -> Any:
-        from tvm_ffi.pyast_trait_parse import parse_assign, parse_store  # noqa: PLC0415
+        # Route to the owning class's *dispatcher* (not directly to
+        # ``parse_assign`` / ``parse_store``) so a user-supplied
+        # ``__ffi_text_parse__`` on the class wins over trait parsing.
+        # See design_docs/parser_tier_dispatch.md §7.
+        from tvm_ffi.parse_dispatch import lookup_parser  # noqa: PLC0415
 
         is_index = isinstance(node.lhs, pyast.Index)
-        if is_index and _store is not None:
-            return parse_store(parser, node, _store)
-        if not is_index and _bind is not None:
-            return parse_assign(parser, node, _bind)
+        target_cls = _store if is_index else _bind
+        if target_cls is not None:
+            owner = sys.modules.get(target_cls.__module__)
+            dispatcher = (
+                lookup_parser(owner, target_cls.__name__)
+                if owner is not None else None
+            )
+            if dispatcher is not None:
+                return dispatcher(parser, node)
+            # No dispatcher — fall back to direct trait-parse
+            # invocation. Should not happen under normal wiring (the
+            # register_parser pass runs before trait rules).
+            from tvm_ffi.pyast_trait_parse import (  # noqa: PLC0415
+                parse_assign, parse_store,
+            )
+
+            parse_fn = parse_store if is_index else parse_assign
+            return parse_fn(parser, node, target_cls)
+
         # Partial router — delegate to another dialect that provides
         # the missing half.
         for dialect in parser.active_dialects():
@@ -820,20 +839,39 @@ def finalize_module(
         Optional class used as the runtime value for a custom
         ``with``-construct — ``__ffi_with_handler__`` will be injected.
     """
+    from tvm_ffi.parse_dispatch import register_parser  # noqa: PLC0415
+
     module = sys.modules[module_name]
     if prefix is None:
         prefix = module_name.rsplit(".", 1)[-1]
 
-    # Discover IR classes belonging to this module (or its subpackages).
+    # Discover ALL ``@py_class`` IR classes in the module (or its
+    # subpackages). ``__tvm_ffi_type_info__`` is the attribute py_class
+    # sets on every registered class — it catches Tier-2 (trait) AND
+    # Tier-3 (bare leaf) classes alike. Only ``__ffi_ir_traits__`` is
+    # still used below to pick the trait-specific wiring rule.
+    all_py_classes: list[type] = []
     ir_classes: list[type] = []
     for _, cls in inspect.getmembers(module):
-        if not (isinstance(cls, type) and hasattr(cls, "__ffi_ir_traits__")):
+        if not (isinstance(cls, type) and hasattr(cls, "__tvm_ffi_type_info__")):
             continue
         cls_mod = getattr(cls, "__module__", None)
         if cls_mod is None:
             continue
-        if cls_mod == module_name or cls_mod.startswith(module_name + "."):
+        if cls_mod != module_name and not cls_mod.startswith(module_name + "."):
+            continue
+        all_py_classes.append(cls)
+        if hasattr(cls, "__ffi_ir_traits__"):
             ir_classes.append(cls)
+
+    # Register a three-tier parse dispatcher for every py_class.
+    # See design_docs/parser_tier_dispatch.md — the dispatcher checks
+    # Tier 1 (__ffi_text_parse__) → Tier 2 (__ffi_ir_traits__) → Tier 3
+    # (reflection default) at call time. Registration MUST happen before
+    # the trait wiring rules run so those rules can reference the
+    # registered dispatcher (e.g., the assign router routes through it).
+    for cls in all_py_classes:
+        register_parser(module, cls)
 
     # Per-class wiring context — accumulates state across rules.
     ctx: dict[str, Any] = {
@@ -854,6 +892,15 @@ def finalize_module(
     # Mount composite attrs accumulated by wiring rules.
     if ctx["op_classes_map"] and not hasattr(module, "__ffi_op_classes__"):
         module.__ffi_op_classes__ = dict(ctx["op_classes_map"])
+
+    # Publish the module's canonical :class:`PrimTy` class (if any)
+    # so :func:`parse_dispatch._normalize_primty_subclass` can
+    # reconstruct a base-class instance from ``_DtypeHandle``-like
+    # subclasses when building IR via Tier-3 default parse.
+    if not hasattr(module, "__ffi_prim_ty__"):
+        prim_ty_cls = _find_class_with_trait(module, tr.PrimTyTraits)
+        if prim_ty_cls is not None:
+            module.__ffi_prim_ty__ = prim_ty_cls  # type: ignore[attr-defined]
 
     # Install the ``__ffi_assign__`` router AFTER every rule has run —
     # deferring here lets both bind and store classes accumulate in

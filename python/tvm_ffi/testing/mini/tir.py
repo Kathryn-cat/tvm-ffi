@@ -229,6 +229,47 @@ class Cast(Object):
     value: Any
 
 
+@py_class("mini.tir.Flag", structural_eq="dag")
+class Flag(Object):
+    """Pure Tier-3 leaf fixture — no trait, no ``__ffi_text_parse__``.
+
+    Tests validate that the default-parse path round-trips a bare
+    ``@py_class`` leaf via reflection only (no wiring in the dialect
+    module beyond the registration that :func:`finalize_module` adds
+    for every IR class).
+    """
+
+    kind: str
+    count: int
+
+
+@py_class("mini.tir.FlagV2", structural_eq="dag")
+class FlagV2(Object):
+    """Tier-1 fixture — opts into ``__ffi_text_parse__`` at class body.
+
+    The method is declared explicitly as the design-doc's canonical
+    Tier-1 escape hatch: it builds ``FlagV2`` from the printed call's
+    first positional arg (``FlagV2("X")`` form) OR from its ``kind``
+    keyword (``FlagV2(kind="X")`` — the default-printer shape). Tests
+    assert the custom parser fires in preference to Tier-3 default.
+    A sentinel attribute (``_FLAG_V2_CUSTOM_FIRED``) on the class lets
+    tests observe that this method ran.
+    """
+
+    kind: str
+
+    @classmethod
+    def __ffi_text_parse__(cls, parser: Any, node: Any) -> "FlagV2":
+        cls._FLAG_V2_CUSTOM_FIRED = True
+        if node.args:
+            return cls(kind=parser.eval_expr(node.args[0]))
+        kwargs = {
+            k: parser.eval_expr(v)
+            for k, v in zip(node.kwargs_keys, node.kwargs_values)
+        }
+        return cls(**kwargs)
+
+
 # ============================================================================
 # Statements
 # ============================================================================

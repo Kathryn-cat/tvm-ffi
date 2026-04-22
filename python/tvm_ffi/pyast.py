@@ -51,6 +51,7 @@ if TYPE_CHECKING:
 # tvm-ffi-stubgen(end)
 
 import contextlib
+import sys
 from collections.abc import Generator, Iterator, Sequence
 from typing import Any, TypeVar
 
@@ -2623,6 +2624,9 @@ class IRParser:
                 return self._lang_modules[node.name]
             return self.resolve_module(node.name)
         if isinstance(node, Attr):
+            qualified = self._maybe_qualified_class(node)
+            if qualified is not None:
+                return qualified
             return getattr(self.eval_expr(node.obj), node.name)
         if isinstance(node, Operation):
             return self.visit_operation(node)
@@ -2644,6 +2648,47 @@ class IRParser:
     def resolve_module(self, name: str) -> Any:
         """Subclass hook for resolving identifiers not in scope or lang modules."""
         raise NameError(f"Unknown identifier: {name!r}")
+
+    def _maybe_qualified_class(self, node: "Attr") -> Any:
+        """Attempt to resolve an ``Attr`` chain as a ``@py_class`` type key.
+
+        The default printer emits leaf IR classes (Tier-3) as their
+        fully-qualified type key — e.g. ``mini.tir.Cast(target=...)``.
+        When the leftmost :class:`Id` isn't a registered language
+        module, flatten the ``Attr`` chain into a dotted string and
+        look it up in the type-key registry. Returns the class on hit,
+        :data:`None` on miss (callers should fall back to the normal
+        attribute walk).
+        """
+        parts: list[str] = []
+        current: Any = node
+        while isinstance(current, Attr):
+            parts.append(current.name)
+            current = current.obj
+        if not isinstance(current, Id):
+            return None
+        root = current.name
+        # If the leftmost Id is a registered lang module or bound
+        # variable, use the normal attribute walk — the type-key
+        # fallback is a last resort.
+        if self.lookup(root) is not None or root in self._lang_modules:
+            return None
+        parts.append(root)
+        parts.reverse()
+        qualified = ".".join(parts)
+        try:
+            from tvm_ffi import core as _core  # noqa: PLC0415
+
+            info = _core._lookup_or_register_type_info_from_type_key(qualified)
+        except Exception:  # noqa: BLE001
+            return None
+        cls = getattr(info, "type_cls", None)
+        if cls is None or cls is Object:
+            # ``type_cls`` defaults to :class:`Object` for type keys
+            # that exist in the FFI-level registry but haven't been
+            # bound to a Python class — treat that as a miss.
+            return None
+        return cls
 
     # ---- Expression visitors ----
 
@@ -2675,21 +2720,60 @@ class IRParser:
     def visit_call(self, node: Call) -> Any:
         """Evaluate a call expression by invoking the resolved callee.
 
-        When the callee is an IR class (has ``__ffi_ir_traits__``), raw
-        Python primitives in the args/kwargs are wrapped via the active
-        dialect's ``__ffi_default_{int,float,bool}_ty__`` handles. This
-        mirrors the sugar-path parser (``parse_binop`` etc.) and lets
-        printed forms like ``T.Add(1, 2)`` (produced when the sugar gate
-        refuses infix) roundtrip back to ``Add(lhs=IntImm(1), rhs=IntImm(2))``.
+        Dispatch is split into three paths:
+
+        1. **Parse-aware dispatcher** — if ``callee.__ffi_parse_aware__``
+           is ``True``, the callee was registered by
+           :func:`tvm_ffi.parse_dispatch.register_parser` and expects
+           ``(parser, node)``. Handles Tier 1 / 2 / 3 internally.
+        2. **IR class (``@py_class``)** — if ``callee`` is a registered
+           IR class, look up its dispatcher via
+           :func:`tvm_ffi.parse_dispatch.lookup_parser` in the owning
+           language module's ``__ffi_parsers__`` registry and invoke it
+           as a parse-aware dispatcher. If no dispatcher is registered,
+           fall back to value-eager construction (with primitive
+           wrapping via the active dialect's
+           ``__ffi_default_{int,float,bool}_ty__`` hooks).
+        3. **Plain callable** — for every other callable (``range``,
+           ``T.float32`` factory, user helper, etc.) evaluate args /
+           kwargs eagerly and invoke the callee with those values.
         """
         callee = self.eval_expr(node.callee)
+
+        # Path 1 — the callee is a parse-aware dispatcher.
+        if getattr(callee, "__ffi_parse_aware__", False):
+            return callee(self, node)
+
+        # Path 2 — the callee is an IR class. Look for a registered
+        # dispatcher in the owning language module. If found, run the
+        # three-tier dispatch; otherwise fall back to value-eager
+        # construction.
+        if isinstance(callee, type) and hasattr(callee, "__tvm_ffi_type_info__"):
+            from tvm_ffi.parse_dispatch import lookup_parser  # noqa: PLC0415
+
+            owner = sys.modules.get(callee.__module__)
+            if owner is not None:
+                dispatcher = lookup_parser(owner, callee.__name__)
+                if dispatcher is not None:
+                    return dispatcher(self, node)
+
+            args = [self.eval_expr(a) for a in node.args]
+            kwargs = {
+                k: self.eval_expr(v)
+                for k, v in zip(node.kwargs_keys, node.kwargs_values)
+            }
+            if hasattr(callee, "__ffi_ir_traits__"):
+                args = [self._wrap_primitive_ast(a) for a in args]
+                kwargs = {
+                    k: self._wrap_primitive_ast(v) for k, v in kwargs.items()
+                }
+            return callee(*args, **kwargs)
+
+        # Path 3 — plain callable, value-eager.
         args = [self.eval_expr(a) for a in node.args]
         kwargs = {
             k: self.eval_expr(v) for k, v in zip(node.kwargs_keys, node.kwargs_values)
         }
-        if isinstance(callee, type) and hasattr(callee, "__ffi_ir_traits__"):
-            args = [self._wrap_primitive_ast(a) for a in args]
-            kwargs = {k: self._wrap_primitive_ast(v) for k, v in kwargs.items()}
         return callee(*args, **kwargs)
 
     def _wrap_primitive_ast(self, value: Any) -> Any:
