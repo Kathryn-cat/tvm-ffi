@@ -182,22 +182,46 @@ def parse_value_def(
 ) -> Any:
     """Parse a value def-site (name + optional type annotation) into an IR Var."""
     if annotation is not None:
-        ty_handle = parser.eval_expr(annotation)
-        var = ty_handle(var_name=name)
+        ty = parser.eval_expr(annotation)
     else:
-        if make_var is None:
-            make_var = parser._lookup_hook("__ffi_make_var__")
-            if make_var is None:
-                raise TypeError(
-                    "parse_value_def: with ``annotation=None`` and "
-                    "``make_var=None``, at least one registered language "
-                    "module must expose ``__ffi_make_var__``. Register "
-                    "the hook or pass an explicit ``make_var`` callable.",
-                )
-        var = make_var(parser, name, default_ty)
+        ty = default_ty
 
+    if make_var is None and annotation is not None:
+        root_id = _annotation_root_id(annotation)
+        if isinstance(root_id, pyast.Id):
+            lang_module = parser._lang_modules.get(root_id.name)
+            if lang_module is not None:
+                make_var = getattr(lang_module, "__ffi_make_var__", None)
+
+    if make_var is None:
+        make_var = parser._lookup_hook("__ffi_make_var__")
+
+    if make_var is None:
+        raise TypeError(
+            f"parse_value_def({name=}): no ``__ffi_make_var__`` hook "
+            f"resolvable — neither the annotation's root dialect nor "
+            f"any registered language module exposes one. Either pass "
+            f"``make_var=`` explicitly or register an ``__ffi_make_var__`` "
+            f"attribute on the relevant language module.",
+        )
+
+    var = make_var(parser, name, ty)
     parser.define(name, var)
     return var
+
+
+def _annotation_root_id(annotation: Any) -> Any:
+    """Return the root :class:`pyast.Id` of an annotation's attribute chain."""
+    node = annotation
+    while True:
+        if isinstance(node, pyast.Attr):
+            node = node.obj
+            continue
+        if isinstance(node, pyast.Call):
+            node = node.callee
+            continue
+        break
+    return node
 
 
 def parse_func(
@@ -358,13 +382,7 @@ def parse_binop(
     ir_class: type,
     trait: tr.BinOpTraits | None = None,
 ) -> Any:
-    """Parse a :class:`pyast.Operation` into a ``BinOpTraits`` IR.
-
-    Handles n-ary flattened operations too: pyast emits ``a and b and c``
-    as a single ``Operation(And, [a, b, c])``. We fold left so the
-    resulting IR is left-associative: ``And(And(a, b), c)``, matching
-    Python's evaluation order and typical IR conventions.
-    """
+    """Parse a :class:`pyast.Operation` into a ``BinOpTraits`` IR."""
     operands = node.operands
     if len(operands) < 2:
         raise ValueError(

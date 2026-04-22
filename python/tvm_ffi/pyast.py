@@ -2318,6 +2318,46 @@ def dump_ast(  # noqa: PLR0912
 
 
 # ============================================================================
+# Parser frames — cross-dialect dispatch stack
+# ============================================================================
+
+
+class Frame:
+    """Generic parser frame — dispatch contribution + IR-construction state."""
+
+    __slots__ = ("dialects", "__dict__")
+
+    def __init__(self, *, dialects: Sequence[Any] | None = None, **data: Any) -> None:
+        self.dialects: list[Any] = list(dialects) if dialects else []
+        if data:
+            self.__dict__.update(data)
+
+
+class FuncFrame(Frame):
+    """Marker frame for a function-definition body (``def f(...): ...``)."""
+
+
+class ForFrame(Frame):
+    """Marker frame for a for-loop body. Pushed by every dialect's
+    ``__ffi_for_handler__`` so ``break`` / ``continue`` validation and
+    loop-carried-var tracking can query the enclosing loop context
+    without caring which dialect owns it."""
+
+
+class IfFrame(Frame):
+    """Marker frame for an if/else branch body."""
+
+
+class WhileFrame(Frame):
+    """Marker frame for a while-loop body."""
+
+
+class WithFrame(Frame):
+    """Marker frame for a with-block body. Pushed by every dialect's
+    ``__ffi_with_handler__``."""
+
+
+# ============================================================================
 # IRParser — trait-driven parser (PyAST → IR objects)
 # ============================================================================
 
@@ -2349,21 +2389,78 @@ class IRParser:
         Parameters
         ----------
         lang_modules
-            The language-module registry — maps identifier strings
-            (``"T"``, …) to Python objects that resolve during
-            ``eval_expr``. Additional parse hooks are discovered on these
-            modules' attributes (see :meth:`_lookup_hook`).
+            Prefix → language-module registry — maps identifier strings
+            (``"T"``, ``"I"``, …) to Python objects that resolve during
+            ``eval_expr(Id("T"))``. Also becomes the initial registered
+            dialect list for frame-based dispatch.
         var_factory
-            TBD
+            Optional legacy ``(name, ty) → Var`` factory, retained for
+            back-compat with tests that still wire it explicitly.
         """
         self._scopes: list[dict[str, Any]] = [{}]
         self._lang_modules: dict[str, Any] = dict(lang_modules) if lang_modules else {}
         self.var_factory = var_factory
 
-    def _lookup_hook(self, name: str) -> Any:
-        """Find ``name`` as an attribute on any registered language module."""
+        # --- Frame-based dispatch state ---
+        self._frames: list[Frame] = []
+        self._registered_dialects: list[Any] = []
         for mod in self._lang_modules.values():
-            val = getattr(mod, name, None)
+            if mod not in self._registered_dialects:
+                self._registered_dialects.append(mod)
+
+    # ------------------------------------------------------------------
+    # Frame-based dispatch API
+    # ------------------------------------------------------------------
+
+    def register_dialect(self, *dialects: Any) -> None:
+        """Add dialects to the parser's base registry."""
+        for d in dialects:
+            if d not in self._registered_dialects:
+                self._registered_dialects.append(d)
+
+    @contextlib.contextmanager
+    def push_frame(self, frame: Frame) -> Iterator[Frame]:
+        """Push ``frame`` onto the dispatch stack for the ``with`` block."""
+        self._frames.append(frame)
+        try:
+            yield frame
+        finally:
+            popped = self._frames.pop()
+            assert popped is frame, (
+                "IRParser frame-stack corruption: the frame popped at exit "
+                f"({type(popped).__name__}) is not the frame that was pushed "
+                f"({type(frame).__name__}). A handler probably mutated "
+                "``_frames`` without using ``push_frame``."
+            )
+
+    @contextlib.contextmanager
+    def with_dialects(self, *dialects: Any) -> Iterator[None]:
+        """Sugar: push a bare :class:`Frame` that only contributes dialects."""
+        with self.push_frame(Frame(dialects=dialects)):
+            yield
+
+    def active_dialects(self) -> Iterator[Any]:
+        """Yield dialects in dispatch order: innermost frame first, then
+        outer frames, then the base registry."""
+        seen: set[int] = set()
+        for frame in reversed(self._frames):
+            for d in frame.dialects:
+                key = id(d)
+                if key in seen:
+                    continue
+                seen.add(key)
+                yield d
+        for d in self._registered_dialects:
+            key = id(d)
+            if key in seen:
+                continue
+            seen.add(key)
+            yield d
+
+    def _lookup_hook(self, name: str) -> Any:
+        """Find ``name`` as an attribute on the nearest active dialect."""
+        for dialect in self.active_dialects():
+            val = getattr(dialect, name, None)
             if val is not None:
                 return val
         return None
@@ -2377,9 +2474,7 @@ class IRParser:
         self._scopes.append({})
 
     def pop_scope(self) -> None:
-        """Close the innermost scope.
-        Raises :class:`RuntimeError` when only the global scope remains on the stack.
-        """
+        """Close the innermost scope."""
         if len(self._scopes) <= 1:
             raise RuntimeError(
                 "pop_scope called with only the global scope on the stack — "
@@ -2592,31 +2687,42 @@ class IRParser:
         if node.op == OperationKind.Parens:
             return self.eval_expr(node.operands[0])
 
-        op_classes = self._lookup_hook("__ffi_op_classes__")
-        if op_classes is None:
-            raise NotImplementedError(
-                "visit_operation: no ``__ffi_op_classes__`` hook on any "
-                "registered language module. Register a "
-                "``{OperationKind.X: '<dotted lang-module path>', ...}`` "
-                "map to enable sugar-form (``a + b``) parsing.",
-            )
+        # ----------------------------------------------------------------
+        # Cross-dialect operation dispatch
+        # ----------------------------------------------------------------
 
-        ref = op_classes.get(node.op)
-        if ref is None:
-            raise NotImplementedError(
-                f"visit_operation: ``__ffi_op_classes__`` has no entry for "
-                f"OperationKind kind={node.op}. Add an entry mapping the "
-                f"kind to a dotted lang-module path (e.g. ``'T.Add'``) so "
-                f"the parser can resolve the parse function for this op.",
-            )
+        tried: list[str] = []
+        for dialect in self.active_dialects():
+            op_classes = getattr(dialect, "__ffi_op_classes__", None)
+            if not op_classes:
+                continue
+            ref = op_classes.get(node.op)
+            if ref is None:
+                continue
+            tried.append(ref)
+            parts = ref.split(".")
+            expr: Expr = Id(name=parts[0])
+            for p in parts[1:]:
+                expr = Attr(obj=expr, name=p)
+            parse_fn = self.eval_expr(expr)
+            result = parse_fn(self, node)
+            if result is not None:
+                return result
 
-        # Resolve the dotted reference
-        parts = ref.split(".")
-        expr: Expr = Id(name=parts[0])
-        for p in parts[1:]:
-            expr = Attr(obj=expr, name=p)
-        parse_fn = self.eval_expr(expr)
-        return parse_fn(self, node)
+        if tried:
+            raise NotImplementedError(
+                f"visit_operation: none of the {len(tried)} handlers "
+                f"({', '.join(tried)}) accepted operation kind={node.op}. "
+                f"Check that at least one dialect's handler matches the "
+                f"operand types at this call site.",
+            )
+        raise NotImplementedError(
+            f"visit_operation: no dialect declares ``__ffi_op_classes__`` "
+            f"with an entry for OperationKind kind={node.op}. Register a "
+            f"``{{OperationKind.X: '<dotted lang-module path>', ...}}`` map "
+            f"on at least one language module to enable sugar-form "
+            f"(``a + b``) parsing.",
+        )
 
     def visit_stmt_block(self, node: StmtBlock) -> Any:
         return self.visit_body(node.stmts)
@@ -2637,16 +2743,11 @@ class IRParser:
             raise TypeError(
                 f"Decorator did not resolve to a callable parse handler: {handler!r}",
             )
-        return handler(self, node)
+        with self.push_frame(FuncFrame(name=node.name.name)):
+            return handler(self, node)
 
     def visit_class(self, node: Class) -> Any:
-        """Parse a class definition via decorator-based registry dispatch.
-
-        Mirror of :meth:`visit_function`: the class-level decorator
-        (typically ``@I.ir_module``) resolves to a callable handler that
-        receives ``(parser, class_node)`` and returns the constructed
-        IR object.
-        """
+        """Parse a class definition via decorator-based registry dispatch."""
         if not node.decorators:
             raise ValueError(
                 f"Class {node.name.name!r} must be decorated to dispatch parser",
@@ -2656,7 +2757,8 @@ class IRParser:
             raise TypeError(
                 f"Decorator did not resolve to a callable parse handler: {handler!r}",
             )
-        return handler(self, node)
+        with self.push_frame(FuncFrame(name=node.name.name, is_class=True)):
+            return handler(self, node)
 
     def visit_return(self, node: Return) -> Any:
         """Parse a ``return <value>`` stmt."""
@@ -2669,11 +2771,11 @@ class IRParser:
     def visit_if(self, node: If) -> Any:
         """Parse ``if / else``. Looks up ``if_stmt`` hook on language modules."""
         cond = self.eval_expr(node.cond)
-        with self.scoped_frame():
+        with self.scoped_frame(), self.push_frame(IfFrame()):
             then_body = self.visit_body(node.then_branch)
         else_body: list[Any] = []
         if node.else_branch:
-            with self.scoped_frame():
+            with self.scoped_frame(), self.push_frame(IfFrame()):
                 else_body = self.visit_body(node.else_branch)
         hook = self._lookup_hook("if_stmt")
         if hook is not None:
@@ -2681,32 +2783,36 @@ class IRParser:
         return (cond, then_body, else_body)
 
     def visit_for(self, node: For) -> Any:
-        """Parse ``for`` loop. Looks up ``for_stmt`` hook on language modules."""
+        """Parse ``for`` loop."""
         iter_val = self.eval_expr(node.rhs)
-        # NOTE: unlike if/while, the loop-var binding happens INSIDE the hook
-        # (needed before visiting body), so we don't pre-visit body here.
+        handler = getattr(type(iter_val), "__ffi_for_handler__", None)
+        if handler is not None:
+            return handler(iter_val, self, node)
         hook = self._lookup_hook("for_stmt")
         if hook is not None:
             return hook(self, node, iter_val)
         # Default fallback — visit body without binding the loop var.
-        with self.scoped_frame():
+        with self.scoped_frame(), self.push_frame(ForFrame()):
             body = self.visit_body(node.body)
         return (node.lhs, iter_val, body)
 
     def visit_with(self, node: With) -> Any:
         """Parse ``with`` stmt. Looks up ``with_stmt`` hook on language modules."""
         ctx = self.eval_expr(node.rhs)
+        handler = getattr(type(ctx), "__ffi_with_handler__", None)
+        if handler is not None:
+            return handler(ctx, self, node)
         hook = self._lookup_hook("with_stmt")
         if hook is not None:
             return hook(self, node, ctx)
-        with self.scoped_frame():
+        with self.scoped_frame(), self.push_frame(WithFrame()):
             body = self.visit_body(node.body)
         return (ctx, body)
 
     def visit_while(self, node: While) -> Any:
         """Parse ``while`` loop. Looks up ``while_stmt`` hook on language modules."""
         cond = self.eval_expr(node.cond)
-        with self.scoped_frame():
+        with self.scoped_frame(), self.push_frame(WhileFrame()):
             body = self.visit_body(node.body)
         hook = self._lookup_hook("while_stmt")
         if hook is not None:

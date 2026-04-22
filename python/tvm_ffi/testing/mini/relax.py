@@ -14,24 +14,14 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-"""Mini-Relax — Relax-flavored fixtures for trait validation.
-
-What this dialect stresses (beyond mini.tir):
-
-* ``R.`` prefix instead of ``T.`` — proves prefix is per-dialect.
-* :class:`Function` with ``text_printer_kind="R.function"``.
-* :class:`Call` with attrs/kwargs — exercises ``CallTraits.attrs`` /
-  ``CallTraits.kwargs`` paths.
-* :class:`MatchCast` — extra :class:`AssignTraits` shape.
-* :class:`TensorStructInfo` / :class:`ShapeStructInfo` — extra
-  ``TyTraits`` shapes (complement to :mod:`mini.tir`'s ``BufferTy``).
-"""
+"""Mini-Relax — Relax-flavored fixture for cross-dialect (Relax + TIR) parser validation."""
 
 # ruff: noqa: A003, D102, N802, UP006, UP045
 
 from __future__ import annotations
 
-from typing import Any, List, Optional  # noqa: UP035
+from dataclasses import dataclass
+from typing import Any, List  # noqa: UP035
 
 from tvm_ffi import Object, pyast
 from tvm_ffi import ir_traits as tr
@@ -40,116 +30,69 @@ from tvm_ffi.dataclasses import field as dc_field
 
 
 # ============================================================================
-# Types — Relax struct info
+# Struct-info types
 # ============================================================================
 
 
-@py_class("mini.relax.PrimSI", structural_eq="dag")
-class PrimStructInfo(Object):
-    """Scalar struct info — ``R.PrimType`` rendering via ``PrimTyTraits``."""
-
-    __ffi_ir_traits__ = tr.PrimTyTraits("$field:dtype")
-    dtype: str
-
-
-@py_class("mini.relax.TensorSI", structural_eq="dag")
+@py_class("mini.relax.TensorStructInfo", structural_eq="dag")
 class TensorStructInfo(Object):
-    """Tensor struct info — ``T.Tensor((shape...), dtype)`` via ``TensorTyTraits``."""
+    """``R.Tensor((shape,), dtype)`` — shape + dtype struct info."""
 
     __ffi_ir_traits__ = tr.TensorTyTraits(
         "$field:shape", "$field:dtype", None,
     )
-    shape: Optional[List[Any]] = None
-    dtype: Optional[str] = None
-
-
-@py_class("mini.relax.ShapeSI", structural_eq="dag")
-class ShapeStructInfo(Object):
-    """Shape struct info — ``T.Shape((dims...))`` via ``ShapeTyTraits``."""
-
-    __ffi_ir_traits__ = tr.ShapeTyTraits("$field:dims", "$field:ndim")
-    dims: Optional[List[Any]] = None
-    ndim: Optional[int] = None
-
-
-@py_class("mini.relax.TupleSI", structural_eq="dag")
-class TupleStructInfo(Object):
-    """Tuple struct info — ``T.Tuple(f1, f2, ...)`` via ``TupleTyTraits``."""
-
-    __ffi_ir_traits__ = tr.TupleTyTraits("$field:fields")
-    fields: List[Any]
-
-
-@py_class("mini.relax.FuncSI", structural_eq="dag")
-class FuncStructInfo(Object):
-    """Function struct info — ``I.FuncType((params...), ret)`` via ``FuncTyTraits``.
-    """
-
-    __ffi_ir_traits__ = tr.FuncTyTraits("$field:params", "$field:ret")
-    params: Optional[List[Any]] = None
-    ret: Optional[Any] = None
+    shape: Any = None
+    dtype: Any = None
 
 
 # ============================================================================
-# Expressions
+# SSA Values
 # ============================================================================
 
 
 @py_class("mini.relax.Var", structural_eq="var")
 class Var(Object):
-    """Relax variable — ``ValueTraits`` with struct_info as the type."""
+    """Relax SSA variable. Struct info on ``ty`` drives the type annotation."""
 
-    __ffi_ir_traits__ = tr.ValueTraits("$field:name", "$field:struct_info", None)
+    __ffi_ir_traits__ = tr.ValueTraits("$field:name", "$field:ty", None)
     name: str = dc_field(structural_eq="ignore")
-    struct_info: Any
+    ty: Any
 
 
-@py_class("mini.relax.Constant", structural_eq="dag")
-class Constant(Object):
-    """Constant — Level 0 default printer (``mini.relax.Constant(...)``)."""
-
-    value: Any
-    dtype: str
+# ============================================================================
+# Operations
+# ============================================================================
 
 
 @py_class("mini.relax.Call", structural_eq="dag")
 class Call(Object):
-    """Call with literal callee + ``attrs`` keyword (``CallTraits.attrs`` path)."""
+    """Generic Relax call: ``R.<name>(args)`` — e.g. ``R.add(x, y)``."""
 
     __ffi_ir_traits__ = tr.CallTraits(
-        "$field:op_name",
-        "$field:args",
-        "$field:attrs",
-        None, None, None,
+        "$field:op_name", "$field:args", None, None, None, None,
     )
     op_name: str
     args: List[Any]
-    attrs: Optional[Any] = None
 
 
-@py_class("mini.relax.Tuple", structural_eq="dag")
-class Tuple(Object):
-    """Tuple literal — Level 0."""
+@py_class("mini.relax.CallTIR", structural_eq="dag")
+class CallTIR(Object):
+    """``R.call_tir(callee, args, out_sinfo)`` — call a TIR primfunc."""
 
-    fields: List[Any]
-
-
-@py_class("mini.relax.TupleGetItem", structural_eq="dag")
-class TupleGetItem(Object):
-    """Indexed tuple access — Level 0."""
-
-    tuple_value: Any
-    index: int
+    __ffi_ir_traits__ = tr.CallTraits(
+        "R.call_tir", "$field:args", None, None, None, None,
+    )
+    args: List[Any]
 
 
 # ============================================================================
-# Bindings (statements)
+# Statements
 # ============================================================================
 
 
-@py_class("mini.relax.VarBinding", structural_eq="tree")
-class VarBinding(Object):
-    """``var: si = value`` — ``AssignTraits``."""
+@py_class("mini.relax.Bind", structural_eq="tree")
+class Bind(Object):
+    """``v: sinfo = expr`` — SSA binding."""
 
     __ffi_ir_traits__ = tr.AssignTraits(
         "$field:var", "$field:value", None, None, None, None,
@@ -158,32 +101,35 @@ class VarBinding(Object):
     var: Var = dc_field(structural_eq="def")
 
 
-@py_class("mini.relax.MatchCast", structural_eq="tree")
-class MatchCast(Object):
-    """``var = R.match_cast(value, struct_info)`` — assign with kind wrapper."""
+@py_class("mini.relax.ReturnOp", structural_eq="tree")
+class ReturnOp(Object):
+    """``return v``."""
 
-    __ffi_ir_traits__ = tr.AssignTraits(
-        "$field:var", "$method:wrapped_rhs", None, None, None, None,
-    )
+    __ffi_ir_traits__ = tr.ReturnTraits("$field:value")
     value: Any
-    struct_info: Any
-    var: Var = dc_field(structural_eq="def")
 
-    def wrapped_rhs(self) -> Any:
-        return Call(
-            op_name="R.match_cast",
-            args=[self.value, self.struct_info],
-        )
+
+@py_class("mini.relax.DataflowBlock", structural_eq="tree")
+class DataflowBlock(Object):
+    """``with R.dataflow(): body`` — the only Relax with-block."""
+
+    __ffi_ir_traits__ = tr.WithTraits(
+        tr.RegionTraits("$field:body", None, None, None),
+        None, None,
+        "R.dataflow",
+        None, None, None,
+    )
+    body: List[Any]
 
 
 # ============================================================================
-# Functions
+# Function
 # ============================================================================
 
 
 @py_class("mini.relax.Function", structural_eq="tree")
 class Function(Object):
-    """``@R.function\\ndef name(params): body``."""
+    """``@R.function def name(params): body``."""
 
     __ffi_ir_traits__ = tr.FuncTraits(
         "$field:name",
@@ -195,9 +141,15 @@ class Function(Object):
     body: List[Any]
 
 
+# ============================================================================
+# IRModule — mixed TIR + Relax module.
+# ``funcs`` can contain :class:`mini.tir.PrimFunc` and/or Relax :class:`Function`.
+# ============================================================================
+
+
 @py_class("mini.relax.IRModule", structural_eq="tree")
 class IRModule(Object):
-    """``@I.ir_module\\nclass Name: <funcs>`` — same as mini.tir.IRModule."""
+    """``@I.ir_module class Name: <funcs>`` — mixed TIR + Relax module."""
 
     __ffi_ir_traits__ = tr.FuncTraits(
         "$field:name",
@@ -209,110 +161,176 @@ class IRModule(Object):
 
 
 # ============================================================================
-# R language module
+# Dataflow with-marker
+# ============================================================================
+
+
+@dataclass
+class _DataflowMarker:
+    """Returned by ``R.dataflow()`` — consumed by ``visit_with`` via
+    :meth:`__ffi_with_handler__` to build a :class:`DataflowBlock`."""
+
+    def __ffi_with_handler__(self, parser, node) -> DataflowBlock:
+        with parser.push_frame(pyast.WithFrame()):
+            body = parser.visit_body(node.body)
+        return DataflowBlock(body=body)
+
+
+# ============================================================================
+# Shared helpers
+# ============================================================================
+
+
+def _make_value(parser: Any, name: str, ty: Any) -> Var:
+    """``__ffi_make_var__`` impl for :class:`RLang` — builds a Relax :class:`Var`."""
+    return Var(name=name, ty=ty)
+
+
+def _assign_impl(parser, node: pyast.Assign) -> Any:
+    """Dispatch ``y = expr`` to a Relax :class:`Bind`."""
+    from tvm_ffi.pyast_trait_parse import parse_assign  # noqa: PLC0415
+
+    return parse_assign(parser, node, Bind)
+
+
+# ============================================================================
+# RLang — the Relax dialect module
 # ============================================================================
 
 
 class RLang:
-    """Mini-Relax ``R`` language module."""
+    """Mini-Relax ``R`` dialect module."""
+
+    # ---- Type constructor ----
+    @staticmethod
+    def Tensor(shape: Any = None, dtype: Any = None) -> TensorStructInfo:
+        if shape is not None:
+            shape = list(shape)
+        return TensorStructInfo(shape=shape, dtype=dtype)
+
+    # ---- Decorator handler ----
+    @staticmethod
+    def function(parser, node) -> Function:
+        """``@R.function`` → :class:`Function`."""
+        from tvm_ffi.pyast_trait_parse import parse_func  # noqa: PLC0415
+
+        with parser.push_frame(pyast.Frame(dialects=[_RLANG])):
+            return parse_func(parser, node, Function)
+
+    # ---- Dataflow with-context factory ----
+    @staticmethod
+    def dataflow() -> _DataflowMarker:
+        return _DataflowMarker()
+
+    # ---- Operations ----
+    @staticmethod
+    def add(x: Any, y: Any) -> Call:
+        return Call(op_name="R.add", args=[x, y])
 
     @staticmethod
-    def Tensor(
-        shape: Optional[Any] = None,
-        dtype: Optional[str] = None,
-    ) -> TensorStructInfo:
-        if shape is not None and not isinstance(shape, (list, tuple)):
-            shape = [shape]
-        return TensorStructInfo(
-            shape=list(shape) if shape is not None else None,
-            dtype=dtype,
-        )
+    def multiply(x: Any, y: Any) -> Call:
+        return Call(op_name="R.multiply", args=[x, y])
 
     @staticmethod
-    def Shape(
-        dims: Optional[Any] = None,
-        ndim: Optional[int] = None,
-    ) -> ShapeStructInfo:
-        if dims is not None and not isinstance(dims, (list, tuple)):
-            dims = [dims]
-        return ShapeStructInfo(
-            dims=list(dims) if dims is not None else None,
-            ndim=ndim,
-        )
+    def flip(x: Any) -> Call:
+        return Call(op_name="R.flip", args=[x])
 
     @staticmethod
-    def Tuple(*fields: Any) -> TupleStructInfo:
-        return TupleStructInfo(fields=list(fields))
+    def output(*values: Any) -> Call:
+        """``R.output(v, ...)`` — marks dataflow-block outputs."""
+        return Call(op_name="R.output", args=list(values))
+
+    # ---- Cross-dialect call ----
+    @staticmethod
+    def call_tir(callee: Any, args: Any, out_sinfo: Any) -> CallTIR:
+        """``R.call_tir(callee, args, out_sinfo)`` — call a TIR primfunc."""
+        return CallTIR(args=[callee, list(args), out_sinfo])
+
+    # ---- Parser protocol hooks ----
+    __ffi_make_var__ = staticmethod(_make_value)
+    __ffi_assign__ = staticmethod(_assign_impl)
 
     @staticmethod
-    def match_cast(value: Any, si: Any) -> Call:
-        # Construct-time helper: produces a Call so a parser sees the same
-        # shape that the printer emits via wrapped_rhs above.
-        return Call(op_name="R.match_cast", args=[value, si])
+    def ret(parser, value: Any) -> ReturnOp:
+        """``return v`` → :class:`ReturnOp`."""
+        return ReturnOp(value=value)
 
 
-# ---- Hooks (parser-side) ----
-
-
-def _bind_hook(parser, var: Var, rhs: Any) -> VarBinding:
-    return VarBinding(var=var, value=rhs)
-
-
-def _function_handler(parser, node) -> Function:
-    from tvm_ffi.pyast_trait_parse import parse_func  # noqa: PLC0415
-    return parse_func(parser, node, Function)
-
-
-RLang.bind = staticmethod(_bind_hook)
-RLang.function = staticmethod(_function_handler)
+_RLANG = RLang()
 
 
 # ============================================================================
-# I language module (shared with mini.tir.IRModule)
+# ILang — cross-dialect IRModule decorator
 # ============================================================================
-
-
-def _ir_module_handler(parser, node) -> IRModule:
-    funcs: list = []
-    parser.push_scope()
-    try:
-        for stmt in node.body:
-            if isinstance(stmt, pyast.Function):
-                funcs.append(parser.visit_function(stmt))
-    finally:
-        parser.pop_scope()
-    return IRModule(name=node.name.name, funcs=funcs)
 
 
 class ILang:
-    """Mini-Relax ``I`` language module."""
-
-    ir_module = staticmethod(_ir_module_handler)
+    """``I`` dialect — module decorator for mixed TIR + Relax modules."""
 
     @staticmethod
-    def FuncType(  # noqa: N802
-        params: Optional[Any] = None,
-        ret: Optional[Any] = None,
-    ) -> FuncStructInfo:
-        if params is not None and not isinstance(params, (list, tuple)):
-            params = [params]
-        return FuncStructInfo(
-            params=list(params) if params is not None else None,
-            ret=ret,
-        )
+    def ir_module(parser, node) -> IRModule:
+        """``@I.ir_module class Name: <funcs>`` → :class:`IRModule`."""
+        funcs: list = []
+        with parser.scoped_frame():
+            for stmt in node.body:
+                if isinstance(stmt, pyast.Function):
+                    funcs.append(parser.visit_function(stmt))
+        return IRModule(name=node.name.name, funcs=funcs)
 
 
 # ============================================================================
-# Parser config
+# Type namespace ``T`` — printer-hardcoded prefix for type traits.
 # ============================================================================
 
 
-R = RLang()
+class _TNamespace:
+    """Unified ``T.`` type namespace used for cross-dialect parsing."""
+
+    Tensor = staticmethod(RLang.Tensor)
+
+
+def _mount_tir_into_type_namespace() -> None:
+    """Attach mini-TIR's scalar dtype handles + ``prim_func`` decorator
+    onto :class:`_TNamespace`."""
+    from tvm_ffi.testing.mini import tir as mt  # noqa: PLC0415
+
+    for dtype_name in (
+        "int8", "int16", "int32", "int64",
+        "uint8", "uint16", "uint32", "uint64", "bool",
+        "float16", "float32", "float64",
+    ):
+        setattr(_TNamespace, dtype_name, getattr(mt.TLang, dtype_name))
+    _TNamespace.prim_func = staticmethod(mt.TLang.prim_func)
+
+
+_mount_tir_into_type_namespace()
+T = _TNamespace()
+
+
+# ============================================================================
+# Parser registry
+# ============================================================================
+
+
+R = _RLANG
 I = ILang()  # noqa: E741
 
-LANG_MODULES: dict[str, Any] = {"R": R, "I": I}
+
+def _build_lang_modules() -> dict[str, Any]:
+    """Construct the cross-dialect ``LANG_MODULES`` dict."""
+    from tvm_ffi.testing.mini import tir as mt  # noqa: PLC0415
+
+    return {
+        "T": T,                 # type namespace (printer hardcode)
+        "R": R,                 # Relax dialect
+        "I": I,                 # shared module decorator
+        "_tir_singleton": mt.T,  # TIR dialect hooks (per-function frame)
+    }
+
+
+LANG_MODULES: dict[str, Any] = _build_lang_modules()
 
 
 def make_var_factory(name: str, ty: Any) -> Var:
-    """Default ``var_factory`` for mini.relax."""
-    return Var(name=name, struct_info=ty)
+    """Legacy ``var_factory=`` shim for :class:`IRParser`."""
+    return _make_value(None, name, ty)

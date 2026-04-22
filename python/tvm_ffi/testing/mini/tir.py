@@ -426,7 +426,7 @@ class IRModule(Object):
 
 @dataclass
 class _IterHolder:
-    """Returned by ``T.serial(...)`` etc. — consumed by the for_stmt hook."""
+    """Returned by ``T.serial(...)`` / ``T.parallel(...)`` / etc."""
 
     kind: str
     start: Any
@@ -434,10 +434,46 @@ class _IterHolder:
     step: Any
     annotations: Optional[Any] = None
 
+    def __ffi_for_handler__(self, parser, node) -> "For":
+        """Build a :class:`For` IR from ``for <lhs> in <self>:`` (pyast)."""
+        from tvm_ffi.pyast_trait_parse import parse_value_def  # noqa: PLC0415
+
+        if not isinstance(node.lhs, pyast.Id):
+            raise NotImplementedError(
+                f"mini.tir For: only ``Id`` loop targets supported, got {type(node.lhs).__name__}",
+            )
+        with parser.scoped_frame(), parser.push_frame(
+            pyast.ForFrame(kind=self.kind),
+        ):
+            loop_var = parse_value_def(
+                parser,
+                node.lhs.name,
+                annotation=None,
+                make_var=TLang.__ffi_make_var__,
+                default_ty=TLang.int32,
+            )
+            body = parser.visit_body(node.body)
+        return For(
+            loop_var=loop_var,
+            start=self.start,
+            end=self.end,
+            step=self.step,
+            body=body,
+            kind=self.kind,
+            annotations=self.annotations,
+        )
+
 
 @dataclass
 class _BlockMarker:
-    """Returned by ``T.block()`` — consumed by the with_stmt hook."""
+    """Returned by ``T.block()`` — consumed by the ``__ffi_with_handler__``
+    iter-type dispatch at ``with T.block():`` parse time."""
+
+    def __ffi_with_handler__(self, parser, node) -> "Block":
+        """Build a :class:`Block` IR from ``with <self>: body``."""
+        with parser.scoped_frame(), parser.push_frame(pyast.WithFrame()):
+            body = parser.visit_body(node.body)
+        return Block(body=body)
 
 
 # ============================================================================
@@ -745,64 +781,24 @@ def _assert_stmt_hook(parser, cond, msg) -> AssertStmt:
 
 
 def _for_stmt_hook(parser, node, iter_val: Any) -> For:
-    """``for i in T.serial(...): body`` → :class:`For` IR.
-
-    Unpacks the ``_IterHolder`` (or plain ``range``) into
-    ``(kind, start, end, step, annotations)``, binds the loop var in a
-    fresh scope via :func:`parse_value_def` (default ty = ``T.int32``),
-    visits the body, and constructs the For IR.
-    """
-    from tvm_ffi.pyast_trait_parse import parse_value_def  # noqa: PLC0415
-
-    if not isinstance(node.lhs, pyast.Id):
-        raise NotImplementedError("Only Id loop targets supported")
-    annotations: Optional[Any] = None
+    """Legacy ``for_stmt`` hook — back-compat path."""
     if isinstance(iter_val, _IterHolder):
-        kind, start, end, step = (
-            iter_val.kind, iter_val.start, iter_val.end, iter_val.step,
+        return iter_val.__ffi_for_handler__(parser, node)
+    if isinstance(iter_val, range):
+        serial_holder = _IterHolder(
+            kind="serial",
+            start=iter_val.start,
+            end=iter_val.stop,
+            step=iter_val.step,
         )
-        annotations = iter_val.annotations
-    elif isinstance(iter_val, range):
-        kind = "serial"
-        start, end, step = iter_val.start, iter_val.stop, iter_val.step
-    else:
-        raise TypeError(
-            f"Unsupported for-iter: {type(iter_val).__name__}",
-        )
-    with parser.scoped_frame():
-        loop_var = parse_value_def(
-            parser,
-            node.lhs.name,
-            annotation=None,
-            make_var=TLang.__ffi_make_var__,
-            default_ty=TLang.int32,
-        )
-        body = parser.visit_body(node.body)
-    # start/end/step are deliberately kept raw (not literal-wrapped):
-    # the printer emits them as the positional args of
-    # ``T.serial(start, end, step)``, which ``eval_expr`` reads back as
-    # raw Python ints. Wrapping would cause a roundtrip mismatch against
-    # fixtures that build ``For(start=0, ...)`` with bare Python values.
-    return For(
-        loop_var=loop_var,
-        start=start,
-        end=end,
-        step=step,
-        body=body,
-        kind=kind,
-        annotations=annotations,
+        return serial_holder.__ffi_for_handler__(parser, node)
+    raise TypeError(
+        f"Unsupported for-iter: {type(iter_val).__name__}",
     )
 
 
 def _load_hook(parser, obj: Any, indices: list) -> BufferLoad:
-    """``A[indices]`` → :class:`BufferLoad`, with literal indices wrapped.
-
-    ``indices`` from :meth:`IRParser.visit_index` are already
-    ``eval_expr``-resolved (Python primitives for literals, IR for
-    sub-expressions). We wrap the primitives here so the roundtrip
-    invariant holds: orig's ``BufferLoad(..., indices=[IntImm(0,
-    int32)])`` prints as ``A[0]`` and parses back to the same shape.
-    """
+    """``A[indices]`` → :class:`BufferLoad`, with literal indices wrapped."""
     return BufferLoad(
         source=obj,
         indices=[_wrap_primitive(i) for i in indices],
@@ -810,36 +806,28 @@ def _load_hook(parser, obj: Any, indices: list) -> BufferLoad:
 
 
 def _with_stmt_hook(parser, node, ctx) -> Any:
-    with parser.scoped_frame():
-        body = parser.visit_body(node.body)
+    """Legacy ``with_stmt`` hook — back-compat path."""
     if isinstance(ctx, _BlockMarker):
-        return Block(body=body)
+        return ctx.__ffi_with_handler__(parser, node)
     raise TypeError(f"Unsupported with-context: {type(ctx).__name__}")
 
 
 def _ret_hook(parser, value: Any) -> Evaluate:
-    """``return x`` → ``Evaluate(Call(op_name="ret", args=[x]))``.
-
-    Inverts the printer-side ``text_printer_return_check`` path on
-    :class:`Evaluate` — when the evaluated ``Call("ret", [x])`` shape
-    prints as ``return x``, the parser must rebuild the wrapped shape.
-    """
+    """``return x`` → ``Evaluate(Call(op_name="ret", args=[x]))``."""
     args = [_wrap_primitive(value)] if value is not None else []
     return Evaluate(value=Call(op_name="ret", args=args))
 
 
 def _prim_func_handler(parser, node) -> PrimFunc:
+    """``@T.prim_func`` → :class:`PrimFunc`."""
     from tvm_ffi.pyast_trait_parse import parse_func  # noqa: PLC0415
-    return parse_func(parser, node, PrimFunc)
+
+    with parser.push_frame(pyast.Frame(dialects=[T])):
+        return parse_func(parser, node, PrimFunc)
 
 
 def _ir_module_handler(parser, node) -> IRModule:
-    """``@I.ir_module class Name: <funcs>`` → :class:`IRModule` IR.
-
-    Walks the class body, dispatching each :class:`pyast.Function` to
-    the parser (which re-routes to the decorator handler — i.e.
-    ``@T.prim_func``). Non-function statements are skipped.
-    """
+    """``@I.ir_module class Name: <funcs>`` → :class:`IRModule` IR."""
     funcs: list = []
     with parser.scoped_frame():
         for stmt in node.body:

@@ -18,6 +18,6 @@
 
 from __future__ import annotations
 
-from . import mlir, relax, synthetic, tir
+from . import mlir, relax, tir
 
-__all__ = ["mlir", "relax", "synthetic", "tir"]
+__all__ = ["mlir", "relax", "tir"]
