@@ -14,7 +14,26 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-"""Mini-Relax — Relax-flavored fixture for cross-dialect (Relax + TIR) parser validation."""
+"""Mini-Relax — Relax-flavored dialect, auto-registered.
+
+Uses :func:`~tvm_ffi.dialect_autogen.finalize_module` (see
+``design_docs/parser_auto_registration.md``). The Python module IS the
+``R`` dialect — ``from tvm_ffi.testing.mini import relax as R`` then
+``R.function`` / ``R.add`` / ``R.dataflow`` all resolve via ordinary
+attribute lookup, with every factory / hook auto-injected.
+
+Keeps only Bucket C dialect-specific code:
+
+* ``TensorStructInfo`` / ``Tensor`` factory — Relax struct-info type
+  (type annotation shape; ``R.Tensor((shape,), dtype)``).
+* ``_DataflowMarker`` — user-provided ``with_marker=`` for
+  ``with R.dataflow(): body`` — auto-gets ``__ffi_with_handler__``.
+* ``call_tir`` / ``output`` — cross-dialect call shapes outside the
+  generic opaque-fallback handler.
+* ``_TNamespace`` — shared ``T.`` type prefix used by the printer's
+  hardcoded TyTraits prefix.
+* ``LANG_MODULES`` / ``make_var_factory`` — back-compat exports.
+"""
 
 # ruff: noqa: A003, D102, N802, UP006, UP045
 
@@ -23,10 +42,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, List  # noqa: UP035
 
-from tvm_ffi import Object, pyast
+from tvm_ffi import Object
 from tvm_ffi import ir_traits as tr
 from tvm_ffi.dataclasses import py_class
 from tvm_ffi.dataclasses import field as dc_field
+from tvm_ffi.dialect_autogen import finalize_module
 
 
 # ============================================================================
@@ -161,132 +181,123 @@ class IRModule(Object):
 
 
 # ============================================================================
-# Dataflow with-marker
+# Bucket C — Dataflow with-marker
+#
+# Relax SSA semantics: vars defined inside a dataflow block are
+# visible in the enclosing function scope (unlike TIR blocks that
+# introduce a fresh scope). The auto-wired ``__ffi_with_handler__``
+# would wrap in ``parser.scoped_frame()`` — dropping those vars on
+# block exit. We pre-define the handler so ``finalize_module``
+# skips auto-wiring (hasattr check), preserving SSA visibility.
 # ============================================================================
 
 
 @dataclass
 class _DataflowMarker:
-    """Returned by ``R.dataflow()`` — consumed by ``visit_with`` via
-    :meth:`__ffi_with_handler__` to build a :class:`DataflowBlock`."""
+    """Returned by ``R.dataflow()`` — consumed by ``visit_with``."""
 
-    def __ffi_with_handler__(self, parser, node) -> DataflowBlock:
-        with parser.push_frame(pyast.WithFrame()):
+    def __ffi_with_handler__(self, parser: Any, node: Any) -> DataflowBlock:
+        from tvm_ffi import pyast as _pyast  # noqa: PLC0415
+
+        with parser.push_frame(_pyast.WithFrame()):
             body = parser.visit_body(node.body)
         return DataflowBlock(body=body)
 
 
 # ============================================================================
-# Shared helpers
+# Bucket C — Tensor struct-info factory
+#
+# ``R.Tensor((shape,), dtype)`` is a user-facing constructor that
+# normalizes ``shape`` to a list. Not auto-derivable from traits.
 # ============================================================================
 
 
-def _make_value(parser: Any, name: str, ty: Any) -> Var:
-    """``__ffi_make_var__`` impl for :class:`RLang` — builds a Relax :class:`Var`."""
-    return Var(name=name, ty=ty)
-
-
-def _assign_impl(parser, node: pyast.Assign) -> Any:
-    """Dispatch ``y = expr`` to a Relax :class:`Bind`."""
-    from tvm_ffi.pyast_trait_parse import parse_assign  # noqa: PLC0415
-
-    return parse_assign(parser, node, Bind)
+def Tensor(shape: Any = None, dtype: Any = None) -> TensorStructInfo:
+    """``R.Tensor(shape, dtype)`` — Relax tensor struct-info factory."""
+    if shape is not None:
+        shape = list(shape)
+    return TensorStructInfo(shape=shape, dtype=dtype)
 
 
 # ============================================================================
-# RLang — the Relax dialect module
+# Bucket C — Cross-dialect call shapes
+#
+# ``R.call_tir(callee, args, out_sinfo)`` builds a :class:`CallTIR`
+# with packed argument shape. ``R.output(*values)`` marks dataflow
+# outputs — a cross-cutting Relax sugar that isn't a generic opaque call.
 # ============================================================================
 
 
-class RLang:
-    """Mini-Relax ``R`` dialect module."""
-
-    # ---- Type constructor ----
-    @staticmethod
-    def Tensor(shape: Any = None, dtype: Any = None) -> TensorStructInfo:
-        if shape is not None:
-            shape = list(shape)
-        return TensorStructInfo(shape=shape, dtype=dtype)
-
-    # ---- Decorator handler ----
-    @staticmethod
-    def function(parser, node) -> Function:
-        """``@R.function`` → :class:`Function`."""
-        from tvm_ffi.pyast_trait_parse import parse_func  # noqa: PLC0415
-
-        with parser.push_frame(pyast.Frame(dialects=[_RLANG])):
-            return parse_func(parser, node, Function)
-
-    # ---- Dataflow with-context factory ----
-    @staticmethod
-    def dataflow() -> _DataflowMarker:
-        return _DataflowMarker()
-
-    # ---- Operations ----
-    @staticmethod
-    def add(x: Any, y: Any) -> Call:
-        return Call(op_name="R.add", args=[x, y])
-
-    @staticmethod
-    def multiply(x: Any, y: Any) -> Call:
-        return Call(op_name="R.multiply", args=[x, y])
-
-    @staticmethod
-    def flip(x: Any) -> Call:
-        return Call(op_name="R.flip", args=[x])
-
-    @staticmethod
-    def output(*values: Any) -> Call:
-        """``R.output(v, ...)`` — marks dataflow-block outputs."""
-        return Call(op_name="R.output", args=list(values))
-
-    # ---- Cross-dialect call ----
-    @staticmethod
-    def call_tir(callee: Any, args: Any, out_sinfo: Any) -> CallTIR:
-        """``R.call_tir(callee, args, out_sinfo)`` — call a TIR primfunc."""
-        return CallTIR(args=[callee, list(args), out_sinfo])
-
-    # ---- Parser protocol hooks ----
-    __ffi_make_var__ = staticmethod(_make_value)
-    __ffi_assign__ = staticmethod(_assign_impl)
-
-    @staticmethod
-    def ret(parser, value: Any) -> ReturnOp:
-        """``return v`` → :class:`ReturnOp`."""
-        return ReturnOp(value=value)
+def call_tir(callee: Any, args: Any, out_sinfo: Any) -> CallTIR:
+    """``R.call_tir(callee, args, out_sinfo)`` — call a TIR primfunc."""
+    return CallTIR(args=[callee, list(args), out_sinfo])
 
 
-_RLANG = RLang()
+def output(*values: Any) -> Call:
+    """``R.output(v, ...)`` — marks dataflow-block outputs."""
+    return Call(op_name="R.output", args=list(values))
 
 
 # ============================================================================
-# ILang — cross-dialect IRModule decorator
+# The single finalize_module call — auto-injects mechanical wiring:
+#
+# * ``function`` class-decorator handler (FuncTraits) — with dialect-A
+#   frame push for the function body.
+# * ``ir_module`` class-decorator handler (for the cross-dialect IRModule).
+# * ``bind`` / ``__ffi_assign__`` / ``ret`` hooks (AssignTraits, ReturnTraits).
+# * ``dataflow`` ctx-factory via ``with_marker=_DataflowMarker``.
+# * ``__ffi_make_var__`` from :class:`Var` (ValueTraits).
+# * ``__getattr__`` fallback → :class:`Call` for ``R.add`` / ``R.multiply`` /
+#   ``R.flip`` / any other dynamic op name (from CallTraits).
 # ============================================================================
 
 
-class ILang:
-    """``I`` dialect — module decorator for mixed TIR + Relax modules."""
+finalize_module(
+    __name__,
+    prefix="R",
+    with_marker=_DataflowMarker,
+)
 
-    @staticmethod
-    def ir_module(parser, node) -> IRModule:
-        """``@I.ir_module class Name: <funcs>`` → :class:`IRModule`."""
-        funcs: list = []
-        with parser.scoped_frame():
-            for stmt in node.body:
-                if isinstance(stmt, pyast.Function):
-                    funcs.append(parser.visit_function(stmt))
-        return IRModule(name=node.name.name, funcs=funcs)
+
+# ============================================================================
+# Back-compat shims for existing tests
+# ============================================================================
+
+
+import sys as _sys  # noqa: E402, PLC0415
+
+_this = _sys.modules[__name__]
+
+
+# ``R = this module`` — the dialect IS the module.
+R = _this  # type: ignore[assignment]
+RLang = _this  # type: ignore[assignment]
+
+# ``I = this module`` — the cross-dialect IRModule decorator handler is
+# auto-wired as ``_this.ir_module``. Tests consume it via ``I.ir_module``.
+I = _this  # type: ignore[assignment]
+ILang = _this  # type: ignore[assignment]
+
+
+def make_var_factory(name: str, ty: Any) -> Var:
+    """Legacy ``var_factory=`` shim for :class:`IRParser`."""
+    return _this.__ffi_make_var__(None, name, ty)  # type: ignore[attr-defined]
 
 
 # ============================================================================
 # Type namespace ``T`` — printer-hardcoded prefix for type traits.
+#
+# Known limitation per ``design_docs/parser_auto_registration.md``:
+# the printer emits ``T.<dtype>`` / ``T.prim_func`` regardless of the
+# owning dialect. We re-export mini-TIR's dtype handles + ``prim_func``
+# decorator under a ``T`` namespace so cross-dialect tests can round-trip.
 # ============================================================================
 
 
 class _TNamespace:
     """Unified ``T.`` type namespace used for cross-dialect parsing."""
 
-    Tensor = staticmethod(RLang.Tensor)
+    Tensor = staticmethod(Tensor)
 
 
 def _mount_tir_into_type_namespace() -> None:
@@ -299,8 +310,8 @@ def _mount_tir_into_type_namespace() -> None:
         "uint8", "uint16", "uint32", "uint64", "bool",
         "float16", "float32", "float64",
     ):
-        setattr(_TNamespace, dtype_name, getattr(mt.TLang, dtype_name))
-    _TNamespace.prim_func = staticmethod(mt.TLang.prim_func)
+        setattr(_TNamespace, dtype_name, getattr(mt, dtype_name))
+    _TNamespace.prim_func = staticmethod(mt.prim_func)
 
 
 _mount_tir_into_type_namespace()
@@ -308,12 +319,8 @@ T = _TNamespace()
 
 
 # ============================================================================
-# Parser registry
+# Parser registry — cross-dialect lang_modules
 # ============================================================================
-
-
-R = _RLANG
-I = ILang()  # noqa: E741
 
 
 def _build_lang_modules() -> dict[str, Any]:
@@ -321,16 +328,11 @@ def _build_lang_modules() -> dict[str, Any]:
     from tvm_ffi.testing.mini import tir as mt  # noqa: PLC0415
 
     return {
-        "T": T,                 # type namespace (printer hardcode)
-        "R": R,                 # Relax dialect
-        "I": I,                 # shared module decorator
-        "_tir_singleton": mt.T,  # TIR dialect hooks (per-function frame)
+        "T": T,                  # type namespace (printer hardcode)
+        "R": R,                  # Relax dialect (this module)
+        "I": I,                  # Cross-dialect IRModule decorator (this module)
+        "_tir_singleton": mt,    # TIR dialect hooks (per-function frame)
     }
 
 
 LANG_MODULES: dict[str, Any] = _build_lang_modules()
-
-
-def make_var_factory(name: str, ty: Any) -> Var:
-    """Legacy ``var_factory=`` shim for :class:`IRParser`."""
-    return _make_value(None, name, ty)

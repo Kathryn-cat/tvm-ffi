@@ -2673,13 +2673,41 @@ class IRParser:
         return obj[tuple(indices)]
 
     def visit_call(self, node: Call) -> Any:
-        """Evaluate a call expression by invoking the resolved callee."""
+        """Evaluate a call expression by invoking the resolved callee.
+
+        When the callee is an IR class (has ``__ffi_ir_traits__``), raw
+        Python primitives in the args/kwargs are wrapped via the active
+        dialect's ``__ffi_default_{int,float,bool}_ty__`` handles. This
+        mirrors the sugar-path parser (``parse_binop`` etc.) and lets
+        printed forms like ``T.Add(1, 2)`` (produced when the sugar gate
+        refuses infix) roundtrip back to ``Add(lhs=IntImm(1), rhs=IntImm(2))``.
+        """
         callee = self.eval_expr(node.callee)
         args = [self.eval_expr(a) for a in node.args]
         kwargs = {
             k: self.eval_expr(v) for k, v in zip(node.kwargs_keys, node.kwargs_values)
         }
+        if isinstance(callee, type) and hasattr(callee, "__ffi_ir_traits__"):
+            args = [self._wrap_primitive_ast(a) for a in args]
+            kwargs = {k: self._wrap_primitive_ast(v) for k, v in kwargs.items()}
         return callee(*args, **kwargs)
+
+    def _wrap_primitive_ast(self, value: Any) -> Any:
+        """Lift raw Python primitives to dialect IR via active-dialect
+        ``__ffi_default_{int,float,bool}_ty__`` hooks. Objects pass through."""
+        if value is None or not isinstance(value, (bool, int, float)):
+            return value
+        if isinstance(value, bool):
+            hook_name = "__ffi_default_bool_ty__"
+        elif isinstance(value, int):
+            hook_name = "__ffi_default_int_ty__"
+        else:
+            hook_name = "__ffi_default_float_ty__"
+        for dialect in self.active_dialects():
+            handle = getattr(dialect, hook_name, None)
+            if handle is not None and callable(handle):
+                return handle(value)
+        return value
 
     def visit_operation(self, node: Operation) -> Any:
         """Dispatch a :class:`Operation` via the lang module's ``__ffi_op_classes__`` map.

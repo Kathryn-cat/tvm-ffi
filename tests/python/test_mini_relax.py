@@ -481,11 +481,20 @@ def test_r5_lang_modules_has_both_dialects():
 
 def test_r5_parser_dialect_auto_register():
     """``IRParser(lang_modules=mr.LANG_MODULES)`` registers Relax,
-    TIR, and the module decorator in the base registry."""
+    TIR, and the module decorator in the base registry.
+
+    Post module-is-dialect refactor, the dialect values are Python
+    modules themselves (not hand-rolled ``RLang`` / ``TLang`` classes).
+    Verify via the expected hooks instead of class names.
+    """
     parser = pyast.IRParser(lang_modules=mr.LANG_MODULES)
-    class_names = {type(d).__name__ for d in parser._registered_dialects}
-    # _TNamespace, RLang, ILang, TLang all expected.
-    assert "RLang" in class_names
-    assert "TLang" in class_names
-    assert "ILang" in class_names
-    assert "_TNamespace" in class_names
+    dialects = parser._registered_dialects
+    # Every dialect must be present — by hook shape rather than class name
+    # since module-is-dialect makes them all ``<class 'module'>``.
+    has_relax = any(getattr(d, "__name__", "").endswith(".relax") for d in dialects)
+    has_tir = any(getattr(d, "__name__", "").endswith(".tir") for d in dialects)
+    assert has_relax, "Relax dialect (mini.relax module) should be registered"
+    assert has_tir, "TIR dialect (mini.tir module) should be registered"
+    # ``T`` namespace (type prefix) is the only non-module dialect.
+    has_t_namespace = any(type(d).__name__ == "_TNamespace" for d in dialects)
+    assert has_t_namespace, "_TNamespace (T type prefix) should be registered"

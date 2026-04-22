@@ -582,13 +582,31 @@ def test_d9_parser_auto_registers_all_dialects():
     """Constructing ``IRParser(lang_modules=mm.LANG_MODULES)`` registers
     every dialect in the base dispatch registry."""
     parser = pyast.IRParser(lang_modules=mm.LANG_MODULES)
-    names = {type(d).__name__ for d in parser._registered_dialects}
-    # ``_TNamespace`` is the T-type sink, not a real dialect — tolerate it.
-    expected = {
-        "_TNamespace", "ArithLang", "MemRefLang", "VectorLang",
-        "ScfLang", "FuncLang", "BuiltinLang", "_SharedHooks",
+    # Post module-is-dialect refactor, each dialect is a Python module
+    # (``<class 'module'>``) rather than a hand-rolled ``*Lang`` class.
+    # Verify via module names + the auxiliary ``_TNamespace`` /
+    # ``_SharedHooks`` classes instead.
+    registered = parser._registered_dialects
+    dialect_mod_names = {
+        getattr(d, "__name__", "").rsplit(".", 1)[-1]
+        for d in registered
+        if type(d).__name__ == "module"
     }
-    assert expected.issubset(names), f"missing dialects: {expected - names}"
+    other_class_names = {
+        type(d).__name__
+        for d in registered
+        if type(d).__name__ != "module"
+    }
+    expected_dialects = {
+        "arith", "memref", "vector", "scf", "func", "builtin",
+    }
+    expected_classes = {"_TNamespace", "_SharedHooks"}
+    assert expected_dialects.issubset(dialect_mod_names), (
+        f"missing dialect modules: {expected_dialects - dialect_mod_names}"
+    )
+    assert expected_classes.issubset(other_class_names), (
+        f"missing aux classes: {expected_classes - other_class_names}"
+    )
 
 
 def test_d9_visit_operation_falls_through_arith_to_vector():

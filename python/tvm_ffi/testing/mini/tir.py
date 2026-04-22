@@ -14,7 +14,32 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-"""Mini-TIR — TIR-flavored fixtures for trait validation."""
+"""Mini-TIR — TIR-flavored dialect, auto-registered.
+
+Refactored to use :func:`~tvm_ffi.dialect_autogen.finalize_module`
+(see ``design_docs/parser_auto_registration.md``). The Python module
+itself IS the ``T`` dialect — ``import tvm_ffi.testing.mini.tir as T``
+then ``T.Add`` / ``T.prim_func`` / ``T.int32`` all resolve via
+attribute lookup, with every factory / hook auto-injected at module
+load time by ``finalize_module``.
+
+The file splits cleanly into three buckets (per §3 of the design doc):
+
+* **Bucket A — IR class declarations** (most of this file). Each IR
+  class carries ``__ffi_ir_traits__`` describing its printer/parser
+  behavior. Unchanged from the pre-refactor layout.
+* **Bucket C — per-IR semantics** that can't be derived from traits
+  alone: the ``_DtypeHandle`` dual-mode callable, the ``_IterHolder``
+  dataclass shape, the ``$global:`` sugar-check / return-check /
+  for-kind-prefix resolvers, and the explicit ``ret`` hook that builds
+  the ``Evaluate(Call("ret", [v]))`` TIR-specific return shape. Kept
+  as explicit user code; ``finalize_module`` respects the ``hasattr``
+  check and won't overwrite anything the user defines.
+* **Bucket B — mechanical wiring** (factories, hooks, op-class maps,
+  dtype handle mounts, default-ty attrs). Eliminated — produced by
+  one ``finalize_module(__name__, ...)`` call at the bottom of the
+  file.
+"""
 
 # ruff: noqa: A003, D102, N802, UP006, UP045
 
@@ -28,6 +53,7 @@ from tvm_ffi import dtype as ffi_dtype
 from tvm_ffi import ir_traits as tr
 from tvm_ffi.dataclasses import py_class
 from tvm_ffi.dataclasses import field as dc_field
+from tvm_ffi.dialect_autogen import finalize_module
 
 
 # ============================================================================
@@ -93,8 +119,14 @@ class FloatImm(Object):
     dtype: Any
 
 
+# ----------------------------------------------------------------------------
+# Bucket C — sugar-check / return-check / kind-prefix policies.
+# Encoded as registered globals so the trait can reference them by name.
+# ----------------------------------------------------------------------------
+
+
 def _no_const_fold(lhs: Any, rhs: Any) -> bool:
-    """Sugar-check: refuse infix sugar when both operands are literals."""
+    """Sugar gate: refuse infix if both operands are literals."""
     return not (
         isinstance(lhs, (IntImm, FloatImm)) and isinstance(rhs, (IntImm, FloatImm))
     )
@@ -106,20 +138,15 @@ def _binop_sugar_check_global(_printer: Any, obj: Any) -> bool:
 
 
 def _binop_traits(op: str, func_name: str) -> tr.BinOpTraits:
-    """BinOp trait factory mirroring TIR's ``.def_ir_traits<BinOpTraitsObj>``."""
+    """Trait-factory helper for the standard mini-TIR BinOps."""
     return tr.BinOpTraits(
-        "$field:lhs",
-        "$field:rhs",
-        op,
-        "$global:mini.tir._binop_sugar_check",
-        func_name,
+        "$field:lhs", "$field:rhs", op,
+        "$global:mini.tir._binop_sugar_check", func_name,
     )
 
 
 @py_class("mini.tir.Add", structural_eq="dag")
 class Add(Object):
-    """``a + b`` — refuses sugar when both operands are literals."""
-
     __ffi_ir_traits__ = _binop_traits("+", "T.Add")
     lhs: Any
     rhs: Any
@@ -127,8 +154,6 @@ class Add(Object):
 
 @py_class("mini.tir.Sub", structural_eq="dag")
 class Sub(Object):
-    """``a - b`` — refuses sugar when both operands are literals."""
-
     __ffi_ir_traits__ = _binop_traits("-", "T.Sub")
     lhs: Any
     rhs: Any
@@ -136,8 +161,6 @@ class Sub(Object):
 
 @py_class("mini.tir.Mul", structural_eq="dag")
 class Mul(Object):
-    """``a * b`` — refuses sugar when both operands are literals."""
-
     __ffi_ir_traits__ = _binop_traits("*", "T.Mul")
     lhs: Any
     rhs: Any
@@ -145,8 +168,6 @@ class Mul(Object):
 
 @py_class("mini.tir.Lt", structural_eq="dag")
 class Lt(Object):
-    """``a < b`` — refuses sugar when both operands are literals."""
-
     __ffi_ir_traits__ = _binop_traits("<", "T.Lt")
     lhs: Any
     rhs: Any
@@ -154,8 +175,6 @@ class Lt(Object):
 
 @py_class("mini.tir.Eq", structural_eq="dag")
 class Eq(Object):
-    """``a == b`` — refuses sugar when both operands are literals."""
-
     __ffi_ir_traits__ = _binop_traits("==", "T.Eq")
     lhs: Any
     rhs: Any
@@ -163,8 +182,6 @@ class Eq(Object):
 
 @py_class("mini.tir.And", structural_eq="dag")
 class And(Object):
-    """``a and b`` — boolean conjunction (Python keyword)."""
-
     __ffi_ir_traits__ = _binop_traits("and", "T.And")
     lhs: Any
     rhs: Any
@@ -172,8 +189,6 @@ class And(Object):
 
 @py_class("mini.tir.Or", structural_eq="dag")
 class Or(Object):
-    """``a or b`` — boolean disjunction (Python keyword)."""
-
     __ffi_ir_traits__ = _binop_traits("or", "T.Or")
     lhs: Any
     rhs: Any
@@ -181,8 +196,6 @@ class Or(Object):
 
 @py_class("mini.tir.Not", structural_eq="dag")
 class Not(Object):
-    """Boolean negation — ``not a``."""
-
     __ffi_ir_traits__ = tr.UnaryOpTraits("$field:a", "not")
     a: Any
 
@@ -192,8 +205,7 @@ class Call(Object):
     """Call with literal callee: ``T.<op_name>(args...)``."""
 
     __ffi_ir_traits__ = tr.CallTraits(
-        "$field:op_name",
-        "$field:args",
+        "$field:op_name", "$field:args",
         None, None, None, None,
     )
     op_name: str
@@ -245,14 +257,20 @@ class BufferStore(Object):
     indices: List[Any]
 
 
+# ----------------------------------------------------------------------------
+# Evaluate — expr-stmt AssignTraits with dynamic kind + return-check.
+# The three ``$global:`` refs encode mini-TIR's convention that a
+# ``Call(op_name="ret", args=[x])`` wrapped in Evaluate prints as
+# ``return x`` (via text_printer_return_check).
+# ----------------------------------------------------------------------------
+
+
 def _evaluate_is_ret_call(obj: Any) -> bool:
-    """Shared helper: detect ``Call(op_name="ret", args=[single])`` shape."""
     return isinstance(obj.value, Call) and obj.value.op_name == "ret" and len(obj.value.args) == 1
 
 
 @register_global_func("mini.tir._evaluate_expr")
 def _evaluate_expr_global(_printer: Any, obj: Any) -> Any:
-    """Global ``rhs`` resolver for :class:`Evaluate`."""
     if _evaluate_is_ret_call(obj):
         return obj.value.args[0]
     return obj.value
@@ -260,7 +278,6 @@ def _evaluate_expr_global(_printer: Any, obj: Any) -> Any:
 
 @register_global_func("mini.tir._evaluate_kind")
 def _evaluate_kind_global(_printer: Any, obj: Any) -> Any:
-    """Global ``text_printer_kind`` resolver for :class:`Evaluate`."""
     if _evaluate_is_ret_call(obj):
         return None
     return "T.evaluate"
@@ -268,25 +285,17 @@ def _evaluate_kind_global(_printer: Any, obj: Any) -> Any:
 
 @register_global_func("mini.tir._evaluate_is_return")
 def _evaluate_is_return_global(_printer: Any, obj: Any) -> bool:
-    """Global ``text_printer_return_check`` resolver for :class:`Evaluate`."""
     return _evaluate_is_ret_call(obj)
 
 
 @py_class("mini.tir.Evaluate", structural_eq="tree")
 class Evaluate(Object):
-    """Expression-statement — ``AssignTraits`` with dynamic kind + return check.
-
-    Support two cases:
-
-    1. ``value = Call(ret, [result])`` → ``return result`` (return inversion)
-    2. ``value = non-call expr`` → ``T.evaluate(expr)`` (kind wrap)
-    """
+    """Expression-statement — ``AssignTraits`` with dynamic kind + return check."""
 
     __ffi_ir_traits__ = tr.AssignTraits(
         None,
         "$global:mini.tir._evaluate_expr",
-        None,
-        None,
+        None, None,
         "$global:mini.tir._evaluate_kind",
         "$global:mini.tir._evaluate_is_return",
     )
@@ -295,8 +304,6 @@ class Evaluate(Object):
 
 @py_class("mini.tir.IfThenElse", structural_eq="tree")
 class IfThenElse(Object):
-    """``if cond: ... else: ...`` — ``IfTraits`` with both regions."""
-
     __ffi_ir_traits__ = tr.IfTraits(
         "$field:cond",
         tr.RegionTraits("$field:then_body", None, None, None),
@@ -309,8 +316,6 @@ class IfThenElse(Object):
 
 @py_class("mini.tir.While", structural_eq="tree")
 class While(Object):
-    """``while cond: body`` — ``WhileTraits``."""
-
     __ffi_ir_traits__ = tr.WhileTraits(
         "$field:cond",
         tr.RegionTraits("$field:body", None, None, None),
@@ -321,36 +326,35 @@ class While(Object):
 
 @py_class("mini.tir.AssertStmt", structural_eq="tree")
 class AssertStmt(Object):
-    """``assert cond, msg`` — ``AssertTraits``."""
-
     __ffi_ir_traits__ = tr.AssertTraits("$field:cond", "$field:message")
     cond: Any
     message: Optional[str] = None
 
 
-# NOTE: There is no separate ReturnStmt in mini.tir — TIR-faithful design.
-# ``return x`` is represented as ``Evaluate(Call(op_name="ret", args=[x]))``
-# (see :class:`Evaluate` above). For ``ReturnTraits`` coverage as an isolated
-# trait fixture, see :class:`mini.synthetic.SReturnNode`.
+# NOTE: no dedicated ReturnStmt — ``return x`` is encoded as
+# ``Evaluate(Call(op_name="ret", args=[x]))``. See the ``ret`` override
+# below: auto-wiring produces a default ``ret`` hook, but mini-TIR
+# needs the special Evaluate-wrapping shape, so the user-defined
+# ``ret`` takes precedence.
+
+
+# ----------------------------------------------------------------------------
+# For — kind resolved via a global. Kinds themselves live in a
+# class-level dtype and are looked up at print time.
+# ----------------------------------------------------------------------------
 
 
 @register_global_func("mini.tir._for_kind_prefix")
 def _for_kind_prefix_global(_printer: Any, obj: Any) -> str:
-    """Global ``text_printer_kind`` resolver for :class:`For`."""
     return f"T.{obj.kind}"
 
 
 @py_class("mini.tir.For", structural_eq="tree")
 class For(Object):
-    """``for i in T.<kind>(start, end, step, annotations={...}): body``."""
-
     __ffi_ir_traits__ = tr.ForTraits(
         tr.RegionTraits("$field:body", "$field:loop_var", None, None),
-        "$field:start",
-        "$field:end",
-        "$field:step",
-        None,
-        None,
+        "$field:start", "$field:end", "$field:step",
+        None, None,
         "$field:annotations",
         "$global:mini.tir._for_kind_prefix",
     )
@@ -378,7 +382,13 @@ class Block(Object):
 
 @py_class("mini.tir.SeqStmt", structural_eq="tree")
 class SeqStmt(Object):
-    """Inline sequence — ``WithTraits`` with ``text_printer_no_frame=True``."""
+    """Inline sequence — ``WithTraits`` with ``text_printer_no_frame=True``.
+
+    ``no_frame=True`` makes this transparent on the printer side (body
+    stmts emitted directly without enclosing syntax) — :func:`finalize_module`
+    correctly skips auto-wiring since SeqStmt has no roundtrippable
+    context-manager form.
+    """
 
     __ffi_ir_traits__ = tr.WithTraits(
         tr.RegionTraits("$field:stmts", None, None, None),
@@ -388,13 +398,13 @@ class SeqStmt(Object):
 
 
 # ============================================================================
-# Functions / modules
+# Function
 # ============================================================================
 
 
 @py_class("mini.tir.PrimFunc", structural_eq="tree")
 class PrimFunc(Object):
-    """``@T.prim_func\\ndef name(params): body`` — minimal (no prologue hook)."""
+    """``@T.prim_func\\ndef name(params): body``."""
 
     __ffi_ir_traits__ = tr.FuncTraits(
         "$field:name",
@@ -406,27 +416,18 @@ class PrimFunc(Object):
     body: List[Any]
 
 
-@py_class("mini.tir.IRModule", structural_eq="tree")
-class IRModule(Object):
-    """``@I.ir_module\\nclass Name: <funcs>`` — FuncTraits class form."""
-
-    __ffi_ir_traits__ = tr.FuncTraits(
-        "$field:name",
-        tr.RegionTraits("$field:funcs", None, None, None),
-        None, "I.ir_module", None,
-    )
-    name: str = dc_field(structural_eq="ignore")
-    funcs: List[Any]
-
-
 # ============================================================================
-# Surface objects (For-iter holders)
+# Bucket C — iter-holder / with-marker dataclasses
+#
+# ``finalize_module`` injects ``__ffi_for_handler__`` / ``__ffi_with_handler__``
+# onto these classes during auto-wiring (category-C frame pushes happen
+# inside the generated methods).
 # ============================================================================
 
 
 @dataclass
 class _IterHolder:
-    """Returned by ``T.serial(...)`` / ``T.parallel(...)`` / etc."""
+    """Runtime value returned by ``T.serial(...)`` / ``T.parallel(...)`` etc."""
 
     kind: str
     start: Any
@@ -434,120 +435,31 @@ class _IterHolder:
     step: Any
     annotations: Optional[Any] = None
 
-    def __ffi_for_handler__(self, parser, node) -> "For":
-        """Build a :class:`For` IR from ``for <lhs> in <self>:`` (pyast)."""
-        from tvm_ffi.pyast_trait_parse import parse_value_def  # noqa: PLC0415
-
-        if not isinstance(node.lhs, pyast.Id):
-            raise NotImplementedError(
-                f"mini.tir For: only ``Id`` loop targets supported, got {type(node.lhs).__name__}",
-            )
-        with parser.scoped_frame(), parser.push_frame(
-            pyast.ForFrame(kind=self.kind),
-        ):
-            loop_var = parse_value_def(
-                parser,
-                node.lhs.name,
-                annotation=None,
-                make_var=TLang.__ffi_make_var__,
-                default_ty=TLang.int32,
-            )
-            body = parser.visit_body(node.body)
-        return For(
-            loop_var=loop_var,
-            start=self.start,
-            end=self.end,
-            step=self.step,
-            body=body,
-            kind=self.kind,
-            annotations=self.annotations,
-        )
-
 
 @dataclass
 class _BlockMarker:
-    """Returned by ``T.block()`` — consumed by the ``__ffi_with_handler__``
-    iter-type dispatch at ``with T.block():`` parse time."""
-
-    def __ffi_with_handler__(self, parser, node) -> "Block":
-        """Build a :class:`Block` IR from ``with <self>: body``."""
-        with parser.scoped_frame(), parser.push_frame(pyast.WithFrame()):
-            body = parser.visit_body(node.body)
-        return Block(body=body)
+    """Runtime value returned by ``T.block()``."""
 
 
 # ============================================================================
-# Helpers — IR-construction shortcuts (NOT parser-side)
+# Bucket C — ``_DtypeHandle`` dual-mode callable
+#
+# Mini-TIR's ergonomic ``T.int32()`` (builds a Var) and ``T.int32(42)``
+# (builds an IntImm) pattern requires types to be callable. :class:`PrimTy`
+# alone isn't — we subclass it with ``__call__`` dispatch.
+#
+# This is mini-TIR *policy*, not auto-derivable; ``finalize_module``
+# sees ``_DtypeHandle`` and uses it as the dtype-handle constructor for
+# every name in ``dtypes=[...]``.
 # ============================================================================
-
-
-def imm(value: Union[int, float], dtype: Any) -> Any:  # noqa: UP007
-    """``imm(42, "int32") -> IntImm``; ``imm(3.14, "f32") -> FloatImm``."""
-    dt = ffi_dtype(dtype) if isinstance(dtype, str) else dtype
-    if isinstance(value, bool) or isinstance(value, int):
-        return IntImm(value=int(value), dtype=dt)
-    return FloatImm(value=float(value), dtype=dt)
-
-
-# ============================================================================
-# T language module (everything callable from printed text)
-# ============================================================================
-
-
-_INT_DTYPES = ("int8", "int16", "int32", "int64",
-                "uint8", "uint16", "uint32", "uint64", "bool")
-_FLOAT_DTYPES = ("float16", "float32", "float64")
-
-
-class TLang:
-    """Mini-TIR ``T`` language module.
-
-    Dtype attributes (``T.int32``, ``T.float32``, ``T.bool`` …) are
-    plain :class:`PrimTy` *instances*, not factories. Under the new
-    language-module protocol ``eval_expr(T.int32)`` must resolve to the
-    type value directly (mirroring how ``PrimTy`` prints from the IR
-    side); the wrapped ``T.int64(42)`` literal form is delegated to
-    :meth:`PrimTy.__call__` so one attribute serves both roles.
-    """
-
-    # ---- BufferTy factory (T.Buffer(shape, dtype, ...)) ----
-    @staticmethod
-    def Buffer(
-        shape: Any,
-        dtype: str,
-        *,
-        strides: Optional[Sequence[int]] = None,
-        elem_offset: Optional[int] = None,
-        scope: Optional[str] = None,
-    ) -> BufferTy:
-        if isinstance(shape, int):
-            shape = [shape]
-        return BufferTy(
-            shape=list(shape),
-            dtype=dtype,
-            strides=list(strides) if strides is not None else None,
-            offset=elem_offset,
-            scope=scope,
-        )
-
-    # ---- Generic Call fallback (T.<unknown_name>(args) -> Call IR) ----
-    def __getattr__(self, name: str) -> Any:
-        if name.startswith("_"):
-            raise AttributeError(name)
-
-        def _opaque_call_factory(*args: Any) -> Call:
-            return Call(op_name=f"T.{name}", args=list(args))
-
-        _opaque_call_factory.__name__ = f"T.{name}"
-        return _opaque_call_factory
 
 
 def _parse_type(
     primty: PrimTy,
     value: Any = None,
-    var_name: str | None = None,
+    var_name: Optional[str] = None,
 ) -> Any:
-    """Dispatcher for ``T.<dtype>(...)`` calls (bound via :class:`_DtypeHandle`)."""
+    """Dispatcher for ``T.<dtype>(...)`` calls bound via :class:`_DtypeHandle`."""
     if value is not None and var_name is not None:
         raise TypeError(
             f"T.{primty.dtype}(...): cannot pass both ``value`` and "
@@ -560,351 +472,204 @@ def _parse_type(
             return FloatImm(value=float(value), dtype=ffi_dtype(dt_str))
         return IntImm(value=int(value), dtype=ffi_dtype(dt_str))
     name = var_name if var_name is not None else "_"
-    return TLang.__ffi_make_var__(None, name, primty)
+    return Var(name=name, ty=PrimTy(dtype=primty.dtype))
 
 
 @py_class("mini.tir._DtypeHandle", structural_eq="dag")
 class _DtypeHandle(PrimTy):
-    """Callable :class:`PrimTy` subclass — the concrete type of
-    ``T.int32`` / ``T.float32`` / …
+    """Callable :class:`PrimTy` subclass. ``T.int32`` / ``T.float32`` / …
+    are ``_DtypeHandle`` instances — callable in two modes:
+
+    * ``T.int32()`` or ``T.int32(var_name="x")`` → :class:`Var`
+    * ``T.int32(42)`` → :class:`IntImm` (``IntImm``/``FloatImm`` based
+      on the stored dtype)
     """
 
-    def __call__(self, value: Any = None, *, var_name: str | None = None) -> Any:
+    def __call__(self, value: Any = None, *, var_name: Optional[str] = None) -> Any:
         return _parse_type(self, value=value, var_name=var_name)
 
 
-# ---- Mount each ``T.<dtype>`` as a _DtypeHandle instance. ----
-for _dt in _INT_DTYPES + _FLOAT_DTYPES:
-    setattr(TLang, _dt, _DtypeHandle(dtype=_dt))
-
-
-# ---- Default dtype handles for bare-literal wrapping ----
-TLang.__ffi_default_int_ty__ = TLang.int32
-TLang.__ffi_default_float_ty__ = TLang.float32
-TLang.__ffi_default_bool_ty__ = TLang.bool
-
-
-# ---- For-iter factories (T.serial / parallel / unroll / vectorized) ----
-def _make_iter_factory(kind: str):
-    def factory(*args: Any, step: Any = None, annotations: Any = None) -> _IterHolder:
-        if len(args) == 1:
-            start_v, end_v = 0, args[0]
-        elif len(args) == 2:
-            start_v, end_v = args[0], args[1]
-        elif len(args) == 3:
-            start_v, end_v, step_pos = args
-            if step is not None and step != step_pos:
-                raise TypeError(f"T.{kind}: positional and kw step disagree")
-            step = step_pos
-        else:
-            raise TypeError(f"T.{kind} expects 1/2/3 positional args, got {len(args)}")
-        return _IterHolder(
-            kind=kind,
-            start=start_v,
-            end=end_v,
-            step=1 if step is None else step,
-            annotations=annotations,
-        )
-
-    factory.__name__ = kind
-    return staticmethod(factory)
-
-
-for _kind in ("serial", "parallel", "unroll", "vectorized"):
-    setattr(TLang, _kind, _make_iter_factory(_kind))
-
-
-# ---- Primitive-wrapping helper (mini-TIR default dtype dispatch) ----
-def _wrap_primitive(value: Any) -> Any:
-    """Wrap a raw Python primitive as a mini-TIR Imm via default dtype handles.
-
-    Used by factories that receive already-evaluated arguments (e.g.
-    ``T.Add(1, 2)``, ``T.evaluate(0)``) where the callers never had a
-    chance to route through :func:`parse_literal`. IR objects pass
-    through unchanged; primitives are dispatched through
-    ``__ffi_default_{bool,int,float}_ty__``.
-    """
-    if value is None or isinstance(value, Object):
-        return value
-    if isinstance(value, bool):
-        return TLang.__ffi_default_bool_ty__(value)
-    if isinstance(value, int):
-        return TLang.__ffi_default_int_ty__(value)
-    if isinstance(value, float):
-        return TLang.__ffi_default_float_ty__(value)
-    return value
-
-
-# ---- Single-method factories ----
-@staticmethod
-def _evaluate_factory(value: Any) -> Evaluate:
-    """``T.evaluate(x)`` — wraps raw primitives before building the IR."""
-    return Evaluate(value=_wrap_primitive(value))
-
-
-@staticmethod
-def _block_factory() -> _BlockMarker:
-    return _BlockMarker()
-
-
-TLang.evaluate = _evaluate_factory
-TLang.block = _block_factory
-
-
-# ---- Operation registry — single source of truth ----
-# Both derive from the single declaration ``_OP_KIND_TO_IR_CLASS`` —
-# adding a new op only requires extending this one dict.
-_OP_KIND_TO_IR_CLASS: dict[int, type] = {
-    # Binary
-    pyast.OperationKind.Add: Add,
-    pyast.OperationKind.Sub: Sub,
-    pyast.OperationKind.Mult: Mul,
-    pyast.OperationKind.Lt: Lt,
-    pyast.OperationKind.Eq: Eq,
-    pyast.OperationKind.And: And,
-    pyast.OperationKind.Or: Or,
-    # Unary
-    pyast.OperationKind.Not: Not,
-}
-
-
-def _wire_op_classes() -> None:
-    """Wire ``__ffi_op_classes__`` and ``T.<Name>`` op factories.
-
-    Each ``T.<Name>`` attribute is a **dual-convention** callable that
-    handles both forms printed by the trait-driven ``PrintBinOp`` /
-    ``PrintUnaryOp``:
-
-    * **Sugar path** — visit_operation resolves ``OperationKind.Add``
-      to ``"T.Add"`` via ``__ffi_op_classes__`` and calls the factory
-      as ``factory(parser, operation_node)``. Routes to
-      :func:`parse_binop` / :func:`parse_unaryop`, which walk the
-      PyAST operation-node's ``operands``.
-
-    * **De-sugared path** — when the printer emits ``T.Add(1, 2)``
-      because the sugar-check refused (e.g. both operands are
-      literals), visit_call invokes the factory as
-      ``factory(lhs_val, rhs_val)`` with already-evaluated args.
-      Wraps raw primitives via :func:`_wrap_primitive` and
-      constructs the IR directly using the trait-declared field names.
-
-    Discrimination is by ``isinstance(args[0], pyast.IRParser)`` — the
-    sugar path always passes the parser as its first argument, while
-    the de-sugared path passes plain values.
-    """
-    from tvm_ffi.pyast_trait_parse import (  # noqa: PLC0415
-        _resolve_field_ref,
-        parse_binop,
-        parse_unaryop,
-    )
-
-    def _make_binop_factory(cls: type) -> Any:
-        trait = cls.__ffi_ir_traits__
-        lhs_field = _resolve_field_ref(
-            trait.lhs, trait_field=f"BinOpTraits.lhs on {cls.__name__}",
-        )
-        rhs_field = _resolve_field_ref(
-            trait.rhs, trait_field=f"BinOpTraits.rhs on {cls.__name__}",
-        )
-
-        def factory(*args: Any) -> Any:
-            if len(args) == 2 and isinstance(args[0], pyast.IRParser):
-                # Sugar path: (parser, pyast.Operation)
-                return parse_binop(args[0], args[1], ir_class=cls)
-            if len(args) != 2:
-                raise TypeError(
-                    f"T.{cls.__name__}: expected 2 args, got {len(args)}",
-                )
-            lhs, rhs = args
-            return cls(
-                **{lhs_field: _wrap_primitive(lhs), rhs_field: _wrap_primitive(rhs)},
-            )
-
-        factory.__name__ = f"T.{cls.__name__}"
-        return factory
-
-    def _make_unaryop_factory(cls: type) -> Any:
-        trait = cls.__ffi_ir_traits__
-        operand_field = _resolve_field_ref(
-            trait.operand, trait_field=f"UnaryOpTraits.operand on {cls.__name__}",
-        )
-
-        def factory(*args: Any) -> Any:
-            if len(args) == 2 and isinstance(args[0], pyast.IRParser):
-                # Sugar path: (parser, pyast.Operation)
-                return parse_unaryop(args[0], args[1], ir_class=cls)
-            if len(args) != 1:
-                raise TypeError(
-                    f"T.{cls.__name__}: expected 1 arg, got {len(args)}",
-                )
-            return cls(**{operand_field: _wrap_primitive(args[0])})
-
-        factory.__name__ = f"T.{cls.__name__}"
-        return factory
-
-    op_classes_map: dict[int, str] = {}
-    for kind, cls in _OP_KIND_TO_IR_CLASS.items():
-        op_classes_map[kind] = f"T.{cls.__name__}"
-        arity = 1 if kind < pyast.OperationKind._UnaryEnd else 2
-        make = _make_unaryop_factory if arity == 1 else _make_binop_factory
-        setattr(TLang, cls.__name__, staticmethod(make(cls)))
-    TLang.__ffi_op_classes__ = op_classes_map
-
-
-_wire_op_classes()
-
-
 # ============================================================================
-# Parser hooks (called by IRParser)
+# Bucket C — ``T.Buffer(...)`` parameterized factory
 # ============================================================================
 
 
-def _bind_hook(parser, var: Var, rhs: Any) -> Bind:
-    return Bind(var=var, value=rhs)
-
-
-def _buffer_store_hook(parser, target, indices: list, value: Any) -> BufferStore:
-    return BufferStore(buffer=target, value=value, indices=indices)
-
-
-def _if_stmt_hook(parser, cond, then_body: list, else_body: list) -> IfThenElse:
-    return IfThenElse(cond=cond, then_body=then_body, else_body=else_body)
-
-
-def _while_stmt_hook(parser, cond, body: list) -> While:
-    return While(cond=cond, body=body)
-
-
-def _assert_stmt_hook(parser, cond, msg) -> AssertStmt:
-    msg_str = msg if (msg is None or isinstance(msg, str)) else str(msg)
-    return AssertStmt(cond=cond, message=msg_str)
-
-
-def _for_stmt_hook(parser, node, iter_val: Any) -> For:
-    """Legacy ``for_stmt`` hook — back-compat path."""
-    if isinstance(iter_val, _IterHolder):
-        return iter_val.__ffi_for_handler__(parser, node)
-    if isinstance(iter_val, range):
-        serial_holder = _IterHolder(
-            kind="serial",
-            start=iter_val.start,
-            end=iter_val.stop,
-            step=iter_val.step,
-        )
-        return serial_holder.__ffi_for_handler__(parser, node)
-    raise TypeError(
-        f"Unsupported for-iter: {type(iter_val).__name__}",
+def Buffer(
+    shape: Any,
+    dtype: str,
+    *,
+    strides: Optional[Sequence[int]] = None,
+    elem_offset: Optional[int] = None,
+    scope: Optional[str] = None,
+) -> BufferTy:
+    """``T.Buffer((shape...), dtype, ...)`` factory."""
+    if isinstance(shape, int):
+        shape = [shape]
+    return BufferTy(
+        shape=list(shape),
+        dtype=dtype,
+        strides=list(strides) if strides is not None else None,
+        offset=elem_offset,
+        scope=scope,
     )
 
 
-def _load_hook(parser, obj: Any, indices: list) -> BufferLoad:
-    """``A[indices]`` → :class:`BufferLoad`, with literal indices wrapped."""
-    return BufferLoad(
-        source=obj,
-        indices=[_wrap_primitive(i) for i in indices],
-    )
+# ============================================================================
+# Bucket C — ``T.ret`` override (Evaluate-wrap pattern)
+#
+# Auto-wiring would produce a generic ``ret`` that builds a ``ReturnTraits``
+# IR — but mini-TIR has no such class. ``return x`` must become
+# ``Evaluate(Call(op_name="ret", args=[x]))`` so the ``$global:_evaluate_is_return``
+# check drives the printer back to ``return x`` on roundtrip.
+#
+# Defined BEFORE ``finalize_module`` so the ``hasattr`` guard skips
+# auto-wiring of ``ret``.
+# ============================================================================
 
 
-def _with_stmt_hook(parser, node, ctx) -> Any:
-    """Legacy ``with_stmt`` hook — back-compat path."""
-    if isinstance(ctx, _BlockMarker):
-        return ctx.__ffi_with_handler__(parser, node)
-    raise TypeError(f"Unsupported with-context: {type(ctx).__name__}")
-
-
-def _ret_hook(parser, value: Any) -> Evaluate:
+def ret(_parser: Any, value: Any) -> Evaluate:
     """``return x`` → ``Evaluate(Call(op_name="ret", args=[x]))``."""
-    args = [_wrap_primitive(value)] if value is not None else []
+    # Wrap raw primitives via the auto-registered default-ty hooks.
+    from tvm_ffi.dialect_autogen import _wrap_primitive_via_module  # noqa: PLC0415
+    import sys as _sys  # noqa: PLC0415
+
+    _mod = _sys.modules[__name__]
+    args = [_wrap_primitive_via_module(value, _mod)] if value is not None else []
     return Evaluate(value=Call(op_name="ret", args=args))
 
 
-def _prim_func_handler(parser, node) -> PrimFunc:
-    """``@T.prim_func`` → :class:`PrimFunc`."""
-    from tvm_ffi.pyast_trait_parse import parse_func  # noqa: PLC0415
-
-    with parser.push_frame(pyast.Frame(dialects=[T])):
-        return parse_func(parser, node, PrimFunc)
-
-
-def _ir_module_handler(parser, node) -> IRModule:
-    """``@I.ir_module class Name: <funcs>`` → :class:`IRModule` IR."""
-    funcs: list = []
-    with parser.scoped_frame():
-        for stmt in node.body:
-            if isinstance(stmt, pyast.Function):
-                funcs.append(parser.visit_function(stmt))
-    return IRModule(name=node.name.name, funcs=funcs)
-
-
-# Canonical Var constructor — the ``__ffi_make_var__`` protocol.
-def _make_var_impl(parser: Any, name: str, ty: Any) -> Var:
-    """Build a mini-TIR ``Var`` from a resolved ``(name, ty)`` pair."""
-    if isinstance(ty, PrimTy):
-        return Var(name=name, ty=PrimTy(dtype=ty.dtype))
-    if isinstance(ty, Var):
-        return Var(name=name, ty=PrimTy(dtype=ty.ty.dtype))
-    return Var(name=name, ty=PrimTy(dtype="int32"))
-
-
-# Canonical assign hook — the ``__ffi_assign__`` protocol.
-def _assign_impl(parser: Any, node: pyast.Assign) -> Any:
-    """Dispatch a :class:`pyast.Assign` to the right trait-driven parser."""
-    from tvm_ffi.pyast_trait_parse import (  # noqa: PLC0415
-        parse_assign,
-        parse_store,
-    )
-
-    if isinstance(node.lhs, pyast.Index):
-        return parse_store(parser, node, BufferStore)
-    return parse_assign(parser, node, Bind)
-
-
-# ---- Wire all hooks onto TLang. ----
-TLang.__ffi_make_var__ = staticmethod(_make_var_impl)
-TLang.__ffi_assign__ = staticmethod(_assign_impl)
-TLang.bind = staticmethod(_bind_hook)
-TLang.buffer_store = staticmethod(_buffer_store_hook)
-TLang.load = staticmethod(_load_hook)
-TLang.if_stmt = staticmethod(_if_stmt_hook)
-TLang.while_stmt = staticmethod(_while_stmt_hook)
-TLang.assert_stmt = staticmethod(_assert_stmt_hook)
-TLang.for_stmt = staticmethod(_for_stmt_hook)
-TLang.with_stmt = staticmethod(_with_stmt_hook)
-TLang.ret = staticmethod(_ret_hook)
-TLang.prim_func = staticmethod(_prim_func_handler)
-
-
 # ============================================================================
-# I language module (module-level decorators)
+# Bucket C — ``T.evaluate(x)`` explicit factory
+#
+# ``Evaluate`` has a dynamic ``text_printer_kind`` (``$global:``) so
+# auto-wiring can't statically determine the factory name. We mount it
+# explicitly: ``T.evaluate(expr)`` → :class:`Evaluate`. Primitive-wrapping
+# happens via ``_wrap_primitive_via_module`` so raw-int / raw-float args
+# become :class:`IntImm` / :class:`FloatImm` on the way in.
 # ============================================================================
 
 
-class ILang:
-    """Mini-TIR ``I`` language module — for ``@I.ir_module``."""
+def evaluate(value: Any) -> Evaluate:  # noqa: A001
+    """``T.evaluate(x)`` — wrap ``x`` in :class:`Evaluate`."""
+    from tvm_ffi.dialect_autogen import _wrap_primitive_via_module  # noqa: PLC0415
+    import sys as _sys  # noqa: PLC0415
 
-    ir_module = staticmethod(_ir_module_handler)
+    _mod = _sys.modules[__name__]
+    return Evaluate(value=_wrap_primitive_via_module(value, _mod))
 
 
-T = TLang()
-I = ILang()  # noqa: E741
+# ============================================================================
+# Bucket C — ``imm`` construction helper (for test fixtures)
+# ============================================================================
 
 
-# Bare-name Call factory for ``ret`` — the one op_name that mini-TIR
-# emits without a ``T.`` prefix, so it parses back as an unqualified
-# identifier. Exposed as a single-entry namespace so it slots into
-# ``LANG_MODULES`` like a lang-module prefix, while behaving as a
-# callable at ``eval_expr(Id("ret"))`` resolution time.
+def imm(value: Union[int, float], dtype: Any) -> Any:  # noqa: UP007
+    """``imm(42, "int32") -> IntImm``; ``imm(3.14, "f32") -> FloatImm``.
+
+    Uses ``builtins.{bool,int,float}`` explicitly because
+    :func:`finalize_module` mounts dtype handles for ``bool`` on the
+    module — shadowing the builtin at the global-name-resolution step.
+    """
+    import builtins as _bi  # noqa: PLC0415
+
+    dt = ffi_dtype(dtype) if isinstance(dtype, _bi.str) else dtype
+    if isinstance(value, (_bi.bool, _bi.int)):
+        return IntImm(value=_bi.int(value), dtype=dt)
+    return FloatImm(value=_bi.float(value), dtype=dt)
+
+
+# ============================================================================
+# The single finalize_module call — auto-injects all mechanical wiring.
+# ============================================================================
+
+
+finalize_module(
+    __name__,
+    prefix="T",
+    iter_kinds=["serial", "parallel", "unroll", "vectorized"],
+    iter_holder=_IterHolder,
+    with_marker=_BlockMarker,
+    dtypes=[
+        "int8", "int16", "int32", "int64",
+        "uint8", "uint16", "uint32", "uint64", "bool",
+        "float16", "float32", "float64",
+    ],
+    default_dtypes={"int": "int32", "float": "float32", "bool": "bool"},
+)
+
+
+# ============================================================================
+# Back-compat shims for existing tests
+#
+# Tests written before the refactor reference ``mt.TLang``, ``mt.LANG_MODULES``,
+# ``mt.make_var_factory``, and ``mt._OP_KIND_TO_IR_CLASS``. Provide these
+# so the ``module-is-dialect`` refactor is drop-in from the test suite's
+# point of view.
+# ============================================================================
+
+
+import sys as _sys  # noqa: E402, PLC0415
+_this = _sys.modules[__name__]
+
+# ``T = this module`` — the dialect IS the module, per the design doc.
+T = _this  # type: ignore[assignment]
+
+# ``TLang`` alias — for back-compat. New code uses ``T``.
+TLang = _this  # type: ignore[assignment]
+
+
+def make_var_factory(name: str, ty: Any) -> Var:
+    """Legacy ``var_factory=`` shim for :class:`~tvm_ffi.pyast.IRParser`.
+
+    Delegates to the module's auto-wired ``__ffi_make_var__``.
+    """
+    return _this.__ffi_make_var__(None, name, ty)  # type: ignore[attr-defined]
+
+
+# The ``I`` dialect lives in ``mini.ir`` post-split (see design doc §7.7).
+# Lazy-import it into ``LANG_MODULES`` so cross-dialect parsers using
+# ``@I.ir_module`` keep working without an explicit import on the
+# test-author's side.
+from tvm_ffi.testing.mini import ir as _ir_mod  # noqa: E402, PLC0415
+
+
 def _ret_call_factory(*args: Any) -> Call:
-    """``ret(...)`` → :class:`Call` with ``op_name="ret"`` — used for the
-    multi-arg / non-returnable path of :class:`Evaluate` (single-arg ret
-    is already inverted to a :class:`~pyast.Return` by the printer).
+    """Bare-name ``ret(...)`` → :class:`Call` with ``op_name="ret"``.
+
+    Used so ``Evaluate(Call(op_name="ret", args=[...]))`` — the mini-TIR
+    return encoding — roundtrips through a bare ``ret(...)`` lookup
+    that isn't namespaced under ``T``.
     """
     return Call(op_name="ret", args=list(args))
 
 
-LANG_MODULES: dict[str, Any] = {"T": T, "I": I, "ret": _ret_call_factory}
+LANG_MODULES = {"T": _this, "I": _ir_mod, "ret": _ret_call_factory}
+
+# Back-compat re-export: tests written pre-split import ``mt.IRModule``
+# directly from ``mini.tir``. The class now lives in ``mini.ir`` (one
+# module per dialect per §7.7), but we alias it here so the rename is
+# transparent to existing fixtures.
+IRModule = _ir_mod.IRModule
 
 
-def make_var_factory(name: str, ty: Any) -> Var:
-    """Legacy ``var_factory=`` shim for :class:`~tvm_ffi.pyast.IRParser`."""
-    return _make_var_impl(None, name, ty)
+# ``_OP_KIND_TO_IR_CLASS`` — derivable from the auto-wired
+# ``__ffi_op_classes__`` map; exposed for tests that assert on its shape.
+def _build_op_kind_to_ir_class() -> dict[int, type]:
+    result: dict[int, type] = {}
+    for kind_int, ref in _this.__ffi_op_classes__.items():  # type: ignore[attr-defined]
+        _, _, cls_name = ref.partition(".")
+        cls = getattr(_this, cls_name, None)
+        if cls is None:
+            # The op_classes map points at the factory function, not the
+            # IR class directly, but the factory name matches the class
+            # name so look it up globally.
+            for _name, _v in _sys.modules[__name__].__dict__.items():
+                if _name == cls_name and isinstance(_v, type):
+                    cls = _v
+                    break
+        if cls is not None and isinstance(cls, type):
+            result[kind_int] = cls
+    return result
+
+
+_OP_KIND_TO_IR_CLASS = _build_op_kind_to_ir_class()
