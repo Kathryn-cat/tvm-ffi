@@ -52,7 +52,7 @@ if TYPE_CHECKING:
 
 import contextlib
 import sys
-from collections.abc import Generator, Iterator, Sequence
+from collections.abc import Callable, Generator, Iterator, Sequence
 from typing import Any, TypeVar
 
 from tvm_ffi import Object
@@ -2359,6 +2359,73 @@ class WithFrame(Frame):
 
 
 # ============================================================================
+# Parse-hook factories — build frame-mutating callables for
+# ``__ffi_parse_hooks__`` declarations. See design_docs/parser_frame_hooks.md.
+# ============================================================================
+
+
+def frame_setter(
+    field: str,
+    frame_cls: type[Frame] = FuncFrame,
+) -> Callable[..., None]:
+    """Return a parse hook that overwrites ``frame.<field>`` with its
+    single positional argument.
+
+    Used for prologue calls like ``T.func_ret(i32)`` that set a scalar
+    property on the enclosing function. Raises :class:`TypeError` at
+    parse time if the hook receives anything other than exactly one
+    positional arg.
+    """
+
+    def _hook(parser: "IRParser", *args: Any, **kwargs: Any) -> None:
+        if kwargs or len(args) != 1:
+            raise TypeError(
+                f"frame_setter({field!r}): expected exactly one positional "
+                f"arg, got args={args!r} kwargs={kwargs!r}",
+            )
+        frame = parser.find_frame(frame_cls, origin=f"frame_setter({field!r})")
+        setattr(frame, field, args[0])
+
+    _hook.__ffi_parse_hook__ = True  # type: ignore[attr-defined]
+    _hook.__name__ = f"_frame_setter_{field}"
+    return _hook
+
+
+def frame_merger(
+    field: str,
+    frame_cls: type[Frame] = FuncFrame,
+) -> Callable[..., None]:
+    """Return a parse hook that shallow-merges a dict arg into
+    ``frame.<field>``.
+
+    Equivalent to ``frame.<field> = {**(frame.<field> or {}), **value}``.
+    Used for prologue calls like ``T.func_attr({"noalias": True})``;
+    multiple such calls in the same body accumulate rather than
+    overwriting each other.
+    """
+
+    def _hook(parser: "IRParser", *args: Any, **kwargs: Any) -> None:
+        if kwargs or len(args) != 1:
+            raise TypeError(
+                f"frame_merger({field!r}): expected exactly one positional "
+                f"dict arg, got args={args!r} kwargs={kwargs!r}",
+            )
+        value = args[0]
+        if not isinstance(value, dict):
+            raise TypeError(
+                f"frame_merger({field!r}): expected dict arg, got "
+                f"{type(value).__name__}",
+            )
+        frame = parser.find_frame(frame_cls, origin=f"frame_merger({field!r})")
+        current = getattr(frame, field, None)
+        setattr(frame, field, {**(current or {}), **value})
+
+    _hook.__ffi_parse_hook__ = True  # type: ignore[attr-defined]
+    _hook.__name__ = f"_frame_merger_{field}"
+    return _hook
+
+
+# ============================================================================
 # IRParser — trait-driven parser (PyAST → IR objects)
 # ============================================================================
 
@@ -2457,6 +2524,31 @@ class IRParser:
                 continue
             seen.add(key)
             yield d
+
+    def find_frame(
+        self,
+        frame_cls: type[Frame],
+        *,
+        origin: str | None = None,
+    ) -> Frame:
+        """Return the innermost active frame of ``frame_cls``.
+
+        Used by parse hooks that need to mutate enclosing-construct state
+        (``FuncFrame.attrs`` from ``T.func_attr({...})`` etc.). Raises
+        :class:`RuntimeError` if no such frame is on the dispatch stack —
+        the error is deliberately loud so missing / mis-ordered frames
+        show up at the site that needs them rather than silently corrupting
+        downstream IR construction.
+        """
+        for frame in reversed(self._frames):
+            if isinstance(frame, frame_cls):
+                return frame
+        origin_s = f" (needed by {origin})" if origin else ""
+        raise RuntimeError(
+            f"find_frame({frame_cls.__name__}): no ancestor frame of that "
+            f"type on the dispatch stack{origin_s}. Active frames: "
+            + ", ".join(type(f).__name__ for f in self._frames),
+        )
 
     def _lookup_hook(self, name: str) -> Any:
         """Find ``name`` as an attribute on the nearest active dialect."""
@@ -2598,12 +2690,22 @@ class IRParser:
         raise NotImplementedError(f"visit: unhandled {type(node).__name__}")
 
     def visit_body(self, stmts: Sequence[Stmt]) -> list[Any]:
-        """Visit a sequence of statements and return their IR objects."""
+        """Visit a sequence of statements and return their IR objects.
+
+        A ``None`` result from ``visit`` is treated as a signal that the
+        statement was consumed by a frame-mutating parse hook (see
+        ``__ffi_parse_hook__`` — e.g. ``T.func_attr({...})`` prologue
+        calls). The ``None`` is dropped so no residue appears in the
+        constructed body.
+        """
         out: list[Any] = []
         for s in stmts:
             if isinstance(s, ExprStmt) and isinstance(s.expr, Id) and s.expr.name == "pass":
                 continue
-            out.append(self.visit(s))
+            result = self.visit(s)
+            if result is None:
+                continue
+            out.append(result)
         return out
 
     def eval_expr(self, node: Expr) -> Any:
@@ -2743,6 +2845,19 @@ class IRParser:
         # Path 1 — the callee is a parse-aware dispatcher.
         if getattr(callee, "__ffi_parse_aware__", False):
             return callee(self, node)
+
+        # Path 1b — the callee is a frame-mutating parse hook (e.g. a
+        # ``T.func_attr({...})`` prologue). The hook receives evaluated
+        # args / kwargs, mutates the enclosing frame, and returns None.
+        # ``visit_body`` filters those Nones so the hook leaves no
+        # body-residue. See design_docs/parser_frame_hooks.md.
+        if getattr(callee, "__ffi_parse_hook__", False):
+            args = [self.eval_expr(a) for a in node.args]
+            kwargs = {
+                k: self.eval_expr(v)
+                for k, v in zip(node.kwargs_keys, node.kwargs_values)
+            }
+            return callee(self, *args, **kwargs)
 
         # Path 2 — the callee is an IR class. Look for a registered
         # dispatcher in the owning language module. If found, run the

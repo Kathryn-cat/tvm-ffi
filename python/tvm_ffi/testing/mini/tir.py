@@ -443,18 +443,73 @@ class SeqStmt(Object):
 # ============================================================================
 
 
+# ----------------------------------------------------------------------------
+# PrimFunc prologue: ``T.func_attr({...})``
+#
+# Mirrors TVM's real ``PrimFuncNode.attrs`` mechanism. The printer-side
+# hook (``$global:mini.tir._print_primfunc_prologue``) emits a bare
+# ``T.func_attr({...})`` call at the head of the function body when
+# ``self.attrs`` is non-empty, and the parser-side hook
+# (``__ffi_parse_hooks__ = {"func_attr": frame_merger("attrs")}``)
+# mutates ``FuncFrame.attrs``; :func:`parse_func`'s frame-readback step
+# then pulls it back onto ``PrimFunc.attrs``.
+# ----------------------------------------------------------------------------
+
+
+@register_global_func("mini.tir._print_primfunc_prologue")
+def _print_primfunc_prologue_global(printer: Any, obj: Any) -> None:
+    """Emit ``T.func_attr({...})`` at the head of the function body iff
+    ``obj.attrs`` is non-empty — the ``text_printer_pre`` hook for
+    :class:`PrimFunc`.
+
+    Signature is ``(printer, obj)`` because the C++
+    ``ResolveWithPrinter`` path calls all ``$global:`` refs with two
+    args. The side effect (appending to the active frame) happens
+    directly here; returning :data:`None` prevents the caller's
+    fallthrough branch from running.
+    """
+    attrs = getattr(obj, "attrs", None)
+    if not attrs:
+        return None
+    # Build the dict literal AST element-by-element. Dispatching the
+    # whole dict through the printer's default handler collapses to
+    # ``ffi.Dict()`` (a call of the FFI dict's type key), which parses
+    # back as an empty dict — not what we want.
+    dict_ast = pyast.Dict(
+        keys=[pyast.Literal(value=k) for k in attrs.keys()],
+        values=[pyast.Literal(value=v) for v in attrs.values()],
+    )
+    call_ast = pyast.Call(
+        callee=pyast.Attr(obj=pyast.Id(name="T"), name="func_attr"),
+        args=[dict_ast],
+        kwargs_keys=[],
+        kwargs_values=[],
+    )
+    printer.frames[-1].stmts.append(pyast.ExprStmt(expr=call_ast))
+    return None
+
+
 @py_class("mini.tir.PrimFunc", structural_eq="tree")
 class PrimFunc(Object):
-    """``@T.prim_func\\ndef name(params): body``."""
+    """``@T.prim_func\\ndef name(params): body``.
+
+    The optional ``attrs`` dict round-trips through the ``T.func_attr({...})``
+    prologue emitted at the head of the function body. An empty / missing
+    ``attrs`` omits the prologue entirely — ``T.func_attr`` appears only
+    when there's something to say.
+    """
 
     __ffi_ir_traits__ = tr.FuncTraits(
         "$field:name",
         tr.RegionTraits("$field:body", "$field:params", None, None),
-        None, "T.prim_func", None,
+        "$field:attrs", "T.prim_func",
+        "$global:mini.tir._print_primfunc_prologue",
     )
+    __ffi_parse_hooks__ = {"func_attr": pyast.frame_merger("attrs")}
     name: str = dc_field(structural_eq="ignore")
     params: List[Var] = dc_field(structural_eq="def")
     body: List[Any]
+    attrs: Optional[dict] = None
 
 
 # ============================================================================

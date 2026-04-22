@@ -224,18 +224,43 @@ def _annotation_root_id(annotation: Any) -> Any:
     return node
 
 
+#: Trait attributes on :class:`FuncTraits` that may carry ``$field:`` refs
+#: whose values are populated by parse hooks (frame-backed fields). See
+#: ``design_docs/parser_frame_hooks.md`` §4.4.
+_FUNC_FRAME_BACKED_TRAIT_ATTRS: tuple[str, ...] = ("attrs",)
+
+
 def parse_func(
     parser: IRParser,
     node: pyast.Function,
     ir_class: type,
     trait: tr.FuncTraits | None = None,
 ) -> Any:
-    """Parse a :class:`pyast.Function` into an IR object via ``FuncTraits``."""
+    """Parse a :class:`pyast.Function` into an IR object via ``FuncTraits``.
+
+    Handles prologue / epilogue calls registered via
+    ``__ffi_parse_hooks__`` by reading back any ``$field:`` refs on
+    frame-backed trait attributes from the enclosing :class:`FuncFrame`
+    after ``visit_body`` has finished. Non-``$field:`` refs (``$method:``
+    / ``$global:``) are skipped — those compute their value at print
+    time and have no parse-side frame analogue.
+    """
     trait = _resolve_trait(ir_class, trait, tr.FuncTraits, "parse_func")
     region = trait.region
     fields: dict[str, Any] = {
         _resolve_field_ref(trait.symbol, trait_field="FuncTraits.symbol"): node.name.name,
     }
+
+    # Discover frame-backed fields: trait attributes (``attrs`` today,
+    # extended as more such fields appear) whose ref points at a
+    # ``$field:NAME`` on the IR class. Those NAMEs get populated from
+    # the enclosing :class:`FuncFrame` after the body parse completes.
+    frame_backed: dict[str, str] = {}
+    for trait_attr in _FUNC_FRAME_BACKED_TRAIT_ATTRS:
+        ref = getattr(trait, trait_attr, None)
+        field_name = _field_from_ref(ref)
+        if field_name is not None:
+            frame_backed[field_name] = field_name
 
     with parser.scoped_frame():
         _define_region_vars(parser, node.args, region, fields)
@@ -251,7 +276,24 @@ def parse_func(
             parser.visit_body(body_ast)
         )
 
+        if frame_backed:
+            frame = parser.find_frame(
+                pyast.FuncFrame, origin="parse_func frame-backed fields",
+            )
+            for ir_field, frame_attr in frame_backed.items():
+                val = frame.__dict__.get(frame_attr)
+                if val is not None:
+                    fields[ir_field] = val
+
     return ir_class(**fields)
+
+
+def _field_from_ref(ref: Any) -> str | None:
+    """Extract the field name from a ``$field:NAME`` ref, or :data:`None`
+    for ``None`` / ``$method:`` / ``$global:`` / literal refs."""
+    if isinstance(ref, str) and ref.startswith("$field:"):
+        return ref[len("$field:"):]
+    return None
 
 
 def parse_assign(

@@ -1393,6 +1393,105 @@ def test_t6_primfunc_with_assert_then_compute():
 
 
 # ============================================================================
+# Parse-hooks: PrimFunc prologue (``T.func_attr({...})``)
+#
+# Covers design_docs/parser_frame_hooks.md end-to-end. ``PrimFunc.attrs``
+# is populated on the parser side via a ``frame_merger("attrs")`` hook
+# that mutates :class:`pyast.FuncFrame`; :func:`parse_func` reads the
+# field back off the frame after ``visit_body``. The printer side
+# emits ``T.func_attr({...})`` at the head of the body iff ``attrs`` is
+# non-empty.
+# ============================================================================
+
+
+def test_primfunc_no_attrs_omits_prologue():
+    """``attrs=None`` (the default) prints no ``T.func_attr`` prologue
+    and roundtrips identically."""
+    a = _v("a", "int32")
+    func = _wrap([mt.Bind(var=_v("x", "int32"), value=a)], params=[a])
+    text = pyast.to_python(func)
+    assert "T.func_attr" not in text
+    _rt(func)
+
+
+def test_primfunc_single_attr_roundtrips_via_prologue():
+    """``T.func_attr({"noalias": True})`` appears at the head of the
+    body and round-trips through the ``frame_merger`` parse hook."""
+    a = _v("a", "int32")
+    func = mt.PrimFunc(
+        name="test_func",
+        params=[a],
+        body=[mt.Bind(var=_v("x", "int32"), value=a)],
+        attrs={"noalias": True},
+    )
+    text = pyast.to_python(func)
+    assert 'T.func_attr({"noalias": True})' in text
+    _rt(func)
+
+
+def test_primfunc_multi_key_attrs_roundtrip():
+    """Dict with several keys prints as a single ``T.func_attr({...})``
+    call — the hook still wraps into exactly one prologue stmt."""
+    func = mt.PrimFunc(
+        name="test_func",
+        params=[],
+        body=[mt.Bind(var=_v("x", "int32"), value=_int(0))],
+        attrs={"noalias": True, "opt_level": 3},
+    )
+    text = pyast.to_python(func)
+    assert text.count("T.func_attr(") == 1
+    _rt(func)
+
+
+def test_primfunc_func_attr_calls_merge_into_one_dict():
+    """Two ``T.func_attr(...)`` calls in the source merge into one
+    ``PrimFunc.attrs`` dict — the semantic of :func:`frame_merger`."""
+    text = (
+        '@T.prim_func\n'
+        'def test_func():\n'
+        '  T.func_attr({"noalias": True})\n'
+        '  T.func_attr({"opt_level": 3})\n'
+        '  x: T.int32 = 0\n'
+    )
+    parser = pyast.IRParser(
+        lang_modules=mt.LANG_MODULES, var_factory=mt.make_var_factory,
+    )
+    [parsed] = parser.parse(text)
+    assert isinstance(parsed, mt.PrimFunc)
+    assert parsed.attrs is not None
+    assert dict(parsed.attrs) == {"noalias": True, "opt_level": 3}
+    # Body has the bind only — the two prologue calls left no residue.
+    assert len(parsed.body) == 1
+
+
+def test_primfunc_func_attr_leaves_no_body_residue():
+    """The prologue call never appears as a body statement — ``visit_body``
+    drops the ``None`` result produced by the hook."""
+    text = (
+        '@T.prim_func\n'
+        'def test_func():\n'
+        '  T.func_attr({"key": 1})\n'
+        '  x: T.int32 = 0\n'
+    )
+    parser = pyast.IRParser(
+        lang_modules=mt.LANG_MODULES, var_factory=mt.make_var_factory,
+    )
+    [parsed] = parser.parse(text)
+    assert len(parsed.body) == 1
+    assert isinstance(parsed.body[0], mt.Bind)
+
+
+def test_find_frame_raises_outside_function_body():
+    """``frame_merger`` / ``frame_setter`` propagate the :class:`RuntimeError`
+    from :meth:`find_frame` when called outside any enclosing :class:`FuncFrame`."""
+    parser = pyast.IRParser(lang_modules=mt.LANG_MODULES)
+    # The module-level ``func_attr`` hook lives on ``mt``.
+    hook = mt.func_attr
+    with pytest.raises(RuntimeError, match="FuncFrame"):
+        hook(parser, {"k": 1})
+
+
+# ============================================================================
 # Tier 7 — Modules
 # ============================================================================
 

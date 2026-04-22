@@ -789,6 +789,89 @@ def _make_iter_factory(kind: str, iter_holder: type) -> Callable:
 
 
 # ============================================================================
+# Parse-hook wiring (``__ffi_parse_hooks__``)
+# See design_docs/parser_frame_hooks.md §4.5.
+# ============================================================================
+
+
+def _wire_parse_hooks(module: "ModuleType", cls: type) -> None:
+    """Install each ``cls.__ffi_parse_hooks__`` entry as a module attribute.
+
+    Keys are the printed names (``"func_attr"``) that
+    :meth:`IRParser.visit_call` resolves via ordinary attribute lookup;
+    values are either a method-name string or a pre-built parse-hook
+    callable. Names already claimed by an earlier wiring rule (e.g. the
+    ``prim_func`` decorator factory set by :func:`_wire_func`) are left
+    alone — the ``hasattr`` guard keeps auto-wiring free of order
+    dependencies.
+    """
+    hooks = getattr(cls, "__ffi_parse_hooks__", None)
+    if not hooks:
+        return
+    if not isinstance(hooks, dict):
+        raise TypeError(
+            f"{cls.__module__}.{cls.__name__}.__ffi_parse_hooks__ must be "
+            f"a dict, got {type(hooks).__name__}",
+        )
+    for hook_name, target in hooks.items():
+        if hasattr(module, hook_name):
+            continue
+        fn = _resolve_parse_hook(cls, hook_name, target)
+        setattr(module, hook_name, fn)
+
+
+def _resolve_parse_hook(
+    cls: type, hook_name: str, target: Any,
+) -> Callable[..., None]:
+    """Resolve a single ``__ffi_parse_hooks__`` value to its callable.
+
+    Accepts:
+
+    * a method-name string — the named class attribute (must be a
+      callable or ``@staticmethod``) is tagged with ``__ffi_parse_hook__``
+      and returned;
+    * a callable pre-marked with ``__ffi_parse_hook__ = True`` (produced
+      by :func:`~tvm_ffi.pyast.frame_setter` / :func:`~tvm_ffi.pyast.frame_merger`
+      or written by hand).
+
+    Any other shape raises a clear :class:`TypeError` at decoration
+    time. Missing or non-callable method references raise
+    :class:`RuntimeError`.
+    """
+    if isinstance(target, str):
+        raw = cls.__dict__.get(target)
+        if raw is None:
+            raise RuntimeError(
+                f"{cls.__name__}.__ffi_parse_hooks__[{hook_name!r}] refs "
+                f"method {target!r} that doesn't exist on the class body",
+            )
+        fn = raw.__func__ if isinstance(raw, staticmethod) else raw
+        if not callable(fn):
+            raise TypeError(
+                f"{cls.__name__}.__ffi_parse_hooks__[{hook_name!r}] refs "
+                f"a non-callable attribute {target!r}",
+            )
+        fn.__ffi_parse_hook__ = True
+        return fn
+
+    if callable(target):
+        if not getattr(target, "__ffi_parse_hook__", False):
+            raise RuntimeError(
+                f"{cls.__name__}.__ffi_parse_hooks__[{hook_name!r}] is a "
+                "callable that isn't marked ``__ffi_parse_hook__=True``. "
+                "Use ``tvm_ffi.pyast.frame_setter`` / ``frame_merger`` or "
+                "set the sentinel explicitly on your custom callable.",
+            )
+        return target
+
+    raise TypeError(
+        f"{cls.__name__}.__ffi_parse_hooks__[{hook_name!r}]: expected a "
+        "method-name string or a marked parse-hook callable, got "
+        f"{type(target).__name__}",
+    )
+
+
+# ============================================================================
 # Top-level entry: finalize_module
 # ============================================================================
 
@@ -888,6 +971,14 @@ def finalize_module(
         rule = _WIRING_RULES.get(type(trait))
         if rule is not None:
             rule(module, cls, trait, ctx)
+
+    # Wire user-declared parse hooks (``__ffi_parse_hooks__``). Runs
+    # after trait rules so factory names like ``prim_func`` installed by
+    # ``_wire_func`` take precedence over any same-named hook key — hook
+    # names are conventionally distinct (``func_attr`` etc.) so this is
+    # a non-issue in practice.
+    for cls in all_py_classes:
+        _wire_parse_hooks(module, cls)
 
     # Mount composite attrs accumulated by wiring rules.
     if ctx["op_classes_map"] and not hasattr(module, "__ffi_op_classes__"):
