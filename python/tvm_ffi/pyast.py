@@ -2479,6 +2479,8 @@ class IRParser:
             return self.visit_stmt_block(node)
         if isinstance(node, Function):
             return self.visit_function(node)
+        if isinstance(node, Class):
+            return self.visit_class(node)
         if isinstance(node, Assign):
             return self.visit_assign(node)
         if isinstance(node, ExprStmt):
@@ -2537,6 +2539,11 @@ class IRParser:
             return [self.eval_expr(v) for v in node.values]
         if isinstance(node, Tuple):
             return tuple(self.eval_expr(v) for v in node.values)
+        if isinstance(node, Dict):
+            return {
+                self.eval_expr(k): self.eval_expr(v)
+                for k, v in zip(node.keys, node.values)
+            }
         raise NotImplementedError(f"eval_expr: unhandled {type(node).__name__}")
 
     def resolve_module(self, name: str) -> Any:
@@ -2624,6 +2631,25 @@ class IRParser:
         if not node.decorators:
             raise ValueError(
                 f"Function {node.name.name!r} must be decorated to dispatch parser",
+            )
+        handler = self.eval_expr(node.decorators[-1])
+        if not callable(handler):
+            raise TypeError(
+                f"Decorator did not resolve to a callable parse handler: {handler!r}",
+            )
+        return handler(self, node)
+
+    def visit_class(self, node: Class) -> Any:
+        """Parse a class definition via decorator-based registry dispatch.
+
+        Mirror of :meth:`visit_function`: the class-level decorator
+        (typically ``@I.ir_module``) resolves to a callable handler that
+        receives ``(parser, class_node)`` and returns the constructed
+        IR object.
+        """
+        if not node.decorators:
+            raise ValueError(
+                f"Class {node.name.name!r} must be decorated to dispatch parser",
             )
         handler = self.eval_expr(node.decorators[-1])
         if not callable(handler):

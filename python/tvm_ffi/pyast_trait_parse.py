@@ -358,19 +358,28 @@ def parse_binop(
     ir_class: type,
     trait: tr.BinOpTraits | None = None,
 ) -> Any:
-    """Parse a :class:`pyast.Operation` (2 operands) into a ``BinOpTraits`` IR."""
-    if len(node.operands) != 2:
+    """Parse a :class:`pyast.Operation` into a ``BinOpTraits`` IR.
+
+    Handles n-ary flattened operations too: pyast emits ``a and b and c``
+    as a single ``Operation(And, [a, b, c])``. We fold left so the
+    resulting IR is left-associative: ``And(And(a, b), c)``, matching
+    Python's evaluation order and typical IR conventions.
+    """
+    operands = node.operands
+    if len(operands) < 2:
         raise ValueError(
-            f"parse_binop: expected 2 operands, got {len(node.operands)}",
+            f"parse_binop: expected >=2 operands, got {len(operands)}",
         )
     trait = _resolve_trait(ir_class, trait, tr.BinOpTraits, "parse_binop")
-    lhs = _wrap_if_literal(parser, node.operands[0])
-    rhs = _wrap_if_literal(parser, node.operands[1])
-    fields: dict[str, Any] = {
-        _resolve_field_ref(trait.lhs, trait_field="BinOpTraits.lhs"): lhs,
-        _resolve_field_ref(trait.rhs, trait_field="BinOpTraits.rhs"): rhs,
-    }
-    return ir_class(**fields)
+    lhs_field = _resolve_field_ref(trait.lhs, trait_field="BinOpTraits.lhs")
+    rhs_field = _resolve_field_ref(trait.rhs, trait_field="BinOpTraits.rhs")
+
+    # Left-fold: ``[a, b, c, ...]`` → ``ir_class(ir_class(a, b), c)`` …
+    result = _wrap_if_literal(parser, operands[0])
+    for raw in operands[1:]:
+        rhs = _wrap_if_literal(parser, raw)
+        result = ir_class(**{lhs_field: result, rhs_field: rhs})
+    return result
 
 
 def parse_return(

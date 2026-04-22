@@ -578,10 +578,32 @@ for _kind in ("serial", "parallel", "unroll", "vectorized"):
     setattr(TLang, _kind, _make_iter_factory(_kind))
 
 
+# ---- Primitive-wrapping helper (mini-TIR default dtype dispatch) ----
+def _wrap_primitive(value: Any) -> Any:
+    """Wrap a raw Python primitive as a mini-TIR Imm via default dtype handles.
+
+    Used by factories that receive already-evaluated arguments (e.g.
+    ``T.Add(1, 2)``, ``T.evaluate(0)``) where the callers never had a
+    chance to route through :func:`parse_literal`. IR objects pass
+    through unchanged; primitives are dispatched through
+    ``__ffi_default_{bool,int,float}_ty__``.
+    """
+    if value is None or isinstance(value, Object):
+        return value
+    if isinstance(value, bool):
+        return TLang.__ffi_default_bool_ty__(value)
+    if isinstance(value, int):
+        return TLang.__ffi_default_int_ty__(value)
+    if isinstance(value, float):
+        return TLang.__ffi_default_float_ty__(value)
+    return value
+
+
 # ---- Single-method factories ----
 @staticmethod
 def _evaluate_factory(value: Any) -> Evaluate:
-    return Evaluate(value=value)
+    """``T.evaluate(x)`` — wraps raw primitives before building the IR."""
+    return Evaluate(value=_wrap_primitive(value))
 
 
 @staticmethod
@@ -611,17 +633,85 @@ _OP_KIND_TO_IR_CLASS: dict[int, type] = {
 
 
 def _wire_op_classes() -> None:
-    """Wire ``__ffi_op_classes__`` and ``T.<Name>`` parse functions."""
-    from functools import partial  # noqa: PLC0415
+    """Wire ``__ffi_op_classes__`` and ``T.<Name>`` op factories.
 
-    from tvm_ffi.pyast_trait_parse import parse_binop, parse_unaryop  # noqa: PLC0415
+    Each ``T.<Name>`` attribute is a **dual-convention** callable that
+    handles both forms printed by the trait-driven ``PrintBinOp`` /
+    ``PrintUnaryOp``:
+
+    * **Sugar path** — visit_operation resolves ``OperationKind.Add``
+      to ``"T.Add"`` via ``__ffi_op_classes__`` and calls the factory
+      as ``factory(parser, operation_node)``. Routes to
+      :func:`parse_binop` / :func:`parse_unaryop`, which walk the
+      PyAST operation-node's ``operands``.
+
+    * **De-sugared path** — when the printer emits ``T.Add(1, 2)``
+      because the sugar-check refused (e.g. both operands are
+      literals), visit_call invokes the factory as
+      ``factory(lhs_val, rhs_val)`` with already-evaluated args.
+      Wraps raw primitives via :func:`_wrap_primitive` and
+      constructs the IR directly using the trait-declared field names.
+
+    Discrimination is by ``isinstance(args[0], pyast.IRParser)`` — the
+    sugar path always passes the parser as its first argument, while
+    the de-sugared path passes plain values.
+    """
+    from tvm_ffi.pyast_trait_parse import (  # noqa: PLC0415
+        _resolve_field_ref,
+        parse_binop,
+        parse_unaryop,
+    )
+
+    def _make_binop_factory(cls: type) -> Any:
+        trait = cls.__ffi_ir_traits__
+        lhs_field = _resolve_field_ref(
+            trait.lhs, trait_field=f"BinOpTraits.lhs on {cls.__name__}",
+        )
+        rhs_field = _resolve_field_ref(
+            trait.rhs, trait_field=f"BinOpTraits.rhs on {cls.__name__}",
+        )
+
+        def factory(*args: Any) -> Any:
+            if len(args) == 2 and isinstance(args[0], pyast.IRParser):
+                # Sugar path: (parser, pyast.Operation)
+                return parse_binop(args[0], args[1], ir_class=cls)
+            if len(args) != 2:
+                raise TypeError(
+                    f"T.{cls.__name__}: expected 2 args, got {len(args)}",
+                )
+            lhs, rhs = args
+            return cls(
+                **{lhs_field: _wrap_primitive(lhs), rhs_field: _wrap_primitive(rhs)},
+            )
+
+        factory.__name__ = f"T.{cls.__name__}"
+        return factory
+
+    def _make_unaryop_factory(cls: type) -> Any:
+        trait = cls.__ffi_ir_traits__
+        operand_field = _resolve_field_ref(
+            trait.operand, trait_field=f"UnaryOpTraits.operand on {cls.__name__}",
+        )
+
+        def factory(*args: Any) -> Any:
+            if len(args) == 2 and isinstance(args[0], pyast.IRParser):
+                # Sugar path: (parser, pyast.Operation)
+                return parse_unaryop(args[0], args[1], ir_class=cls)
+            if len(args) != 1:
+                raise TypeError(
+                    f"T.{cls.__name__}: expected 1 arg, got {len(args)}",
+                )
+            return cls(**{operand_field: _wrap_primitive(args[0])})
+
+        factory.__name__ = f"T.{cls.__name__}"
+        return factory
 
     op_classes_map: dict[int, str] = {}
     for kind, cls in _OP_KIND_TO_IR_CLASS.items():
         op_classes_map[kind] = f"T.{cls.__name__}"
         arity = 1 if kind < pyast.OperationKind._UnaryEnd else 2
-        parse_fn = parse_unaryop if arity == 1 else parse_binop
-        setattr(TLang, cls.__name__, staticmethod(partial(parse_fn, ir_class=cls)))
+        make = _make_unaryop_factory if arity == 1 else _make_binop_factory
+        setattr(TLang, cls.__name__, staticmethod(make(cls)))
     TLang.__ffi_op_classes__ = op_classes_map
 
 
@@ -655,6 +745,15 @@ def _assert_stmt_hook(parser, cond, msg) -> AssertStmt:
 
 
 def _for_stmt_hook(parser, node, iter_val: Any) -> For:
+    """``for i in T.serial(...): body`` → :class:`For` IR.
+
+    Unpacks the ``_IterHolder`` (or plain ``range``) into
+    ``(kind, start, end, step, annotations)``, binds the loop var in a
+    fresh scope via :func:`parse_value_def` (default ty = ``T.int32``),
+    visits the body, and constructs the For IR.
+    """
+    from tvm_ffi.pyast_trait_parse import parse_value_def  # noqa: PLC0415
+
     if not isinstance(node.lhs, pyast.Id):
         raise NotImplementedError("Only Id loop targets supported")
     annotations: Optional[Any] = None
@@ -670,13 +769,20 @@ def _for_stmt_hook(parser, node, iter_val: Any) -> For:
         raise TypeError(
             f"Unsupported for-iter: {type(iter_val).__name__}",
         )
-    parser.push_scope()
-    try:
-        loop_var = parser.make_var(node.lhs.name, None)
-        parser.define(node.lhs.name, loop_var)
+    with parser.scoped_frame():
+        loop_var = parse_value_def(
+            parser,
+            node.lhs.name,
+            annotation=None,
+            make_var=TLang.__ffi_make_var__,
+            default_ty=TLang.int32,
+        )
         body = parser.visit_body(node.body)
-    finally:
-        parser.pop_scope()
+    # start/end/step are deliberately kept raw (not literal-wrapped):
+    # the printer emits them as the positional args of
+    # ``T.serial(start, end, step)``, which ``eval_expr`` reads back as
+    # raw Python ints. Wrapping would cause a roundtrip mismatch against
+    # fixtures that build ``For(start=0, ...)`` with bare Python values.
     return For(
         loop_var=loop_var,
         start=start,
@@ -688,15 +794,38 @@ def _for_stmt_hook(parser, node, iter_val: Any) -> For:
     )
 
 
+def _load_hook(parser, obj: Any, indices: list) -> BufferLoad:
+    """``A[indices]`` → :class:`BufferLoad`, with literal indices wrapped.
+
+    ``indices`` from :meth:`IRParser.visit_index` are already
+    ``eval_expr``-resolved (Python primitives for literals, IR for
+    sub-expressions). We wrap the primitives here so the roundtrip
+    invariant holds: orig's ``BufferLoad(..., indices=[IntImm(0,
+    int32)])`` prints as ``A[0]`` and parses back to the same shape.
+    """
+    return BufferLoad(
+        source=obj,
+        indices=[_wrap_primitive(i) for i in indices],
+    )
+
+
 def _with_stmt_hook(parser, node, ctx) -> Any:
-    parser.push_scope()
-    try:
+    with parser.scoped_frame():
         body = parser.visit_body(node.body)
-    finally:
-        parser.pop_scope()
     if isinstance(ctx, _BlockMarker):
         return Block(body=body)
     raise TypeError(f"Unsupported with-context: {type(ctx).__name__}")
+
+
+def _ret_hook(parser, value: Any) -> Evaluate:
+    """``return x`` → ``Evaluate(Call(op_name="ret", args=[x]))``.
+
+    Inverts the printer-side ``text_printer_return_check`` path on
+    :class:`Evaluate` — when the evaluated ``Call("ret", [x])`` shape
+    prints as ``return x``, the parser must rebuild the wrapped shape.
+    """
+    args = [_wrap_primitive(value)] if value is not None else []
+    return Evaluate(value=Call(op_name="ret", args=args))
 
 
 def _prim_func_handler(parser, node) -> PrimFunc:
@@ -705,14 +834,17 @@ def _prim_func_handler(parser, node) -> PrimFunc:
 
 
 def _ir_module_handler(parser, node) -> IRModule:
+    """``@I.ir_module class Name: <funcs>`` → :class:`IRModule` IR.
+
+    Walks the class body, dispatching each :class:`pyast.Function` to
+    the parser (which re-routes to the decorator handler — i.e.
+    ``@T.prim_func``). Non-function statements are skipped.
+    """
     funcs: list = []
-    parser.push_scope()
-    try:
+    with parser.scoped_frame():
         for stmt in node.body:
             if isinstance(stmt, pyast.Function):
                 funcs.append(parser.visit_function(stmt))
-    finally:
-        parser.pop_scope()
     return IRModule(name=node.name.name, funcs=funcs)
 
 
@@ -744,11 +876,13 @@ TLang.__ffi_make_var__ = staticmethod(_make_var_impl)
 TLang.__ffi_assign__ = staticmethod(_assign_impl)
 TLang.bind = staticmethod(_bind_hook)
 TLang.buffer_store = staticmethod(_buffer_store_hook)
+TLang.load = staticmethod(_load_hook)
 TLang.if_stmt = staticmethod(_if_stmt_hook)
 TLang.while_stmt = staticmethod(_while_stmt_hook)
 TLang.assert_stmt = staticmethod(_assert_stmt_hook)
 TLang.for_stmt = staticmethod(_for_stmt_hook)
 TLang.with_stmt = staticmethod(_with_stmt_hook)
+TLang.ret = staticmethod(_ret_hook)
 TLang.prim_func = staticmethod(_prim_func_handler)
 
 
@@ -766,7 +900,21 @@ class ILang:
 T = TLang()
 I = ILang()  # noqa: E741
 
-LANG_MODULES: dict[str, Any] = {"T": T, "I": I}
+
+# Bare-name Call factory for ``ret`` — the one op_name that mini-TIR
+# emits without a ``T.`` prefix, so it parses back as an unqualified
+# identifier. Exposed as a single-entry namespace so it slots into
+# ``LANG_MODULES`` like a lang-module prefix, while behaving as a
+# callable at ``eval_expr(Id("ret"))`` resolution time.
+def _ret_call_factory(*args: Any) -> Call:
+    """``ret(...)`` → :class:`Call` with ``op_name="ret"`` — used for the
+    multi-arg / non-returnable path of :class:`Evaluate` (single-arg ret
+    is already inverted to a :class:`~pyast.Return` by the printer).
+    """
+    return Call(op_name="ret", args=list(args))
+
+
+LANG_MODULES: dict[str, Any] = {"T": T, "I": I, "ret": _ret_call_factory}
 
 
 def make_var_factory(name: str, ty: Any) -> Var:
