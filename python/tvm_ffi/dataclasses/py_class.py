@@ -219,31 +219,107 @@ def _collect_own_fields(  # noqa: PLR0912
     return fields
 
 
-def _collect_py_methods(cls: type) -> list[tuple[str, Any, bool]] | None:
-    """Extract recognized FFI dunder methods and type attrs from the class body.
+def _classify(name: str, value: Any) -> tuple[str, Any, bool]:
+    """Return the ``(name, func, is_static)`` shape :func:`_collect_py_methods`
+    produces. :class:`staticmethod` descriptors are unwrapped; everything
+    else (including non-callable trait metadata like ``__ffi_ir_traits__``)
+    passes through with ``is_static=False``."""
+    if isinstance(value, staticmethod):
+        return (name, value.__func__, True)
+    return (name, value, False)
 
-    Only names listed in :data:`_FFI_RECOGNIZED_METHODS` are collected.
-    Callables are collected with their ``is_static`` flag; non-callable
-    values (e.g. ``__ffi_ir_traits__``) are collected as-is — the Cython
-    layer routes them to ``TVMFFITypeRegisterAttr`` based on name.
 
-    Returns a list of ``(name, value, is_static)`` tuples, or ``None``
-    if no eligible entries were found.
+def _validate_ffi_method(cls: type, name: Any) -> Any:
+    """Validate a single ``__ffi_methods__`` entry; return the class-body value.
+
+    Rejects names that collide with the TypeAttrColumn allowlist, names
+    that start with the reserved FFI prefix, Python protocol dunders,
+    missing bodies, :class:`classmethod` descriptors, and non-callables.
+    The aggregated error messages surface at ``@py_class`` decoration
+    time so users see problems before any reflection lookup fires.
     """
-    methods: list[tuple[str, Any, bool]] = []
-    for name, value in cls.__dict__.items():
-        if name not in _FFI_RECOGNIZED_METHODS:
-            continue
-        if isinstance(value, staticmethod):
-            func = value.__func__
-            is_static = True
-        elif callable(value):
-            func = value
-            is_static = False
-        else:
-            func = value
-            is_static = False
-        methods.append((name, func, is_static))
+    if not isinstance(name, str):
+        raise TypeError(
+            f"@py_class({cls.__name__!r}): __ffi_methods__ entries must be "
+            f"strings, got {type(name).__name__}",
+        )
+    if name in _FFI_TYPE_ATTR_NAMES:
+        raise NameError(
+            f"@py_class({cls.__name__!r}): {name!r} is a TypeAttrColumn "
+            "name — define it directly on the class body; no "
+            "__ffi_methods__ entry is needed.",
+        )
+    if any(name.startswith(p) for p in _FFI_METHOD_RESERVED_PREFIXES):
+        raise NameError(
+            f"@py_class({cls.__name__!r}): {name!r} starts with a reserved "
+            f"FFI prefix ({_FFI_METHOD_RESERVED_PREFIXES}). Pick a "
+            "different name.",
+        )
+    if name.startswith("__") and name.endswith("__"):
+        raise NameError(
+            f"@py_class({cls.__name__!r}): {name!r} is a Python protocol "
+            "dunder — these are reserved for Python semantics and cannot "
+            "be registered as FFI TypeMethods.",
+        )
+    if name not in cls.__dict__:
+        raise AttributeError(
+            f"@py_class({cls.__name__!r}): __ffi_methods__ lists {name!r} "
+            "but no such attribute is defined on the class body. Add a "
+            "@staticmethod with signature (printer, obj) -> ..., or "
+            "remove the entry.",
+        )
+    value = cls.__dict__[name]
+    if isinstance(value, classmethod):
+        raise TypeError(
+            f"@py_class({cls.__name__!r}): {name!r} is a @classmethod, "
+            "which is not supported for FFI TypeMethod registration "
+            "(the classmethod's ``cls`` arg does not match the packed-"
+            "call convention). Use @staticmethod instead.",
+        )
+    if not (isinstance(value, staticmethod) or callable(value)):
+        raise TypeError(
+            f"@py_class({cls.__name__!r}): {name!r} must be a callable or "
+            f"@staticmethod (got {type(value).__name__}).",
+        )
+    return value
+
+
+def _collect_py_methods(cls: type) -> list[tuple[str, Any, bool]] | None:
+    """Extract FFI-registered entries from the class body.
+
+    Collects from two sources:
+
+    1. **TypeAttrColumn dunders** — names in :data:`_FFI_RECOGNIZED_METHODS`
+       that appear in ``cls.__dict__``. Callables (``__ffi_repr__``) and
+       non-callable values (``__ffi_ir_traits__``) both flow here; the
+       Cython layer routes them to ``TVMFFITypeRegisterAttr`` based on
+       name.
+    2. **User-declared TypeMethods** — names listed in ``cls.__ffi_methods__``
+       (a tuple / list / set of strings). Each name is validated via
+       :func:`_validate_ffi_method` and registered via
+       ``TVMFFITypeRegisterMethod`` — this is what makes ``$method:NAME``
+       references in IR traits resolvable from the C++ printer.
+
+    Returns the ``(name, value, is_static)`` list, or ``None`` when no
+    entries were found (so ``_register_py_methods`` can skip the call).
+    """
+    methods: list[tuple[str, Any, bool]] = [
+        _classify(name, value)
+        for name, value in cls.__dict__.items()
+        if name in _FFI_RECOGNIZED_METHODS
+    ]
+
+    declared = cls.__dict__.get("__ffi_methods__")
+    if declared is not None:
+        if not isinstance(declared, (list, tuple, set, frozenset)):
+            raise TypeError(
+                f"@py_class({cls.__name__!r}): __ffi_methods__ must be a "
+                "tuple / list / set of method-name strings (got "
+                f"{type(declared).__name__}).",
+            )
+        for name in declared:
+            methods.append(_classify(name, _validate_ffi_method(cls, name)))
+
     return methods if methods else None
 
 
@@ -466,13 +542,20 @@ _FFI_TYPE_ATTR_NAMES: frozenset[str] = frozenset(
 )
 
 #: Allowlist of dunder names that ``_collect_py_methods`` collects from
-#: the class body.  Names in ``_FFI_TYPE_ATTR_NAMES`` are registered as
-#: TypeAttrColumn entries; all other names are registered as TypeMethod.
+#: the class body WITHOUT requiring an ``__ffi_methods__`` opt-in entry.
+#: Names in this set are registered as TypeAttrColumn entries; all other
+#: registered names go to TypeMethod (see :func:`_collect_py_methods`).
 #:
 #: System-managed names (``__ffi_new__``, ``__ffi_init__``,
-#: ``__ffi_shallow_copy__``) are intentionally
-#: absent because the C++ runtime generates them.
+#: ``__ffi_shallow_copy__``) are intentionally absent because the C++
+#: runtime generates them.
 _FFI_RECOGNIZED_METHODS: frozenset[str] = _FFI_TYPE_ATTR_NAMES
+
+#: Name prefixes reserved for FFI / system use. Entries in a user's
+#: ``__ffi_methods__`` declaration cannot start with any of these — this
+#: prevents collisions with auto-generated methods like ``__ffi_init__``,
+#: ``__ffi_shallow_copy__``, and the TypeAttrColumn dunders.
+_FFI_METHOD_RESERVED_PREFIXES: tuple[str, ...] = ("__ffi_",)
 
 
 @dataclass_transform(

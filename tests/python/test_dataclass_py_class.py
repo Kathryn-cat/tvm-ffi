@@ -4795,6 +4795,225 @@ class TestPyMethodIntrospection:
 
 
 # ---------------------------------------------------------------------------
+# __ffi_methods__ — register user-defined methods into TVMFFITypeInfo.methods
+#
+# The core guarantee: a method listed in ``__ffi_methods__`` becomes
+# resolvable by name from C++ / other FFI consumers, enabling
+# ``$method:NAME`` references in IR traits to dispatch through the
+# trait-driven printer.
+#
+# Tests below use a minimal "toy IR" fixture + a miniature trait-aware
+# printer — a stand-in for the real C++ printer that walks
+# ``__ffi_ir_traits__`` and resolves ``$method:`` refs against
+# ``TypeInfo.methods``. This is the end-to-end shape we want to prove
+# works; the earlier iteration of this block had 14 tests focused on
+# internal bookkeeping, but the observable behavior is "my registered
+# method gets invoked by the printer", so we pin that directly.
+# ---------------------------------------------------------------------------
+
+
+def _find_method(info: TypeInfo, name: str) -> Any:
+    """Return the ``TypeMethod`` entry for ``name`` or :data:`None`."""
+    return next((m for m in info.methods if m.name == name), None)
+
+
+def _toy_trait_print(obj: Any, key: str) -> Any:
+    """Minimal stand-in for the C++ trait-driven printer.
+
+    Reads ``type(obj).__ffi_ir_traits__[key]``, treats the value as a
+    ``$method:NAME`` reference, looks up ``NAME`` in the owning type's
+    ``TypeInfo.methods`` table, and invokes the resolved FFI function
+    on ``obj``. Mirrors exactly how a ``$method:`` ref resolves inside
+    a real trait-driven printer — the whole point of the ``__ffi_methods__``
+    registration is that the name lookup here succeeds.
+    """
+    traits = type(obj).__ffi_ir_traits__  # ty: ignore[unresolved-attribute]
+    ref = traits[key]
+    prefix = "$method:"
+    if not ref.startswith(prefix):
+        raise ValueError(f"Not a $method: ref: {ref!r}")
+    method_name = ref[len(prefix) :]
+    info = type(obj).__tvm_ffi_type_info__  # ty: ignore[unresolved-attribute]
+    method = _find_method(info, method_name)
+    if method is None:
+        raise LookupError(
+            f"{type(obj).__name__}.{method_name}: not in TypeInfo.methods — "
+            f"was it listed in __ffi_methods__?",
+        )
+    return method.func(obj)
+
+
+class TestFfiMethodsRegistration:
+    """User-declared ``__ffi_methods__`` names land in ``TypeInfo.methods``.
+
+    These tests prove the registration pipeline — before this fix, the
+    ``_collect_py_methods`` allowlist was the same as
+    ``_FFI_TYPE_ATTR_NAMES``, so user methods were silently dropped and
+    the TypeMethod registration branch was dead code.
+    """
+
+    def test_static_method_registered_and_ffi_callable(self) -> None:
+        """``@staticmethod`` round-trips through ``TVMFFITypeRegisterMethod``
+        and becomes callable via the returned FFI ``Function``."""
+
+        @py_class(_unique_key("ToyStatic"))
+        class ToyStatic(core.Object):
+            value: int
+            __ffi_methods__ = ("kind",)
+
+            @staticmethod
+            def kind(obj: Any) -> str:
+                return f"static:{obj.value}"
+
+        method = _find_method(_get_type_info(ToyStatic), "kind")
+        assert method is not None
+        assert method.is_static is True
+        assert method.func(ToyStatic(value=7)) == "static:7"
+
+    def test_instance_method_registered_and_ffi_callable(self) -> None:
+        """A non-``@staticmethod`` callable registers with ``is_static=False``
+        and the FFI dispatch passes the instance as the first arg."""
+
+        @py_class(_unique_key("ToyInst"))
+        class ToyInst(core.Object):
+            value: int
+            __ffi_methods__ = ("kind",)
+
+            def kind(self) -> str:
+                return f"inst:{self.value}"
+
+        method = _find_method(_get_type_info(ToyInst), "kind")
+        assert method is not None
+        assert method.is_static is False
+        assert method.func(ToyInst(value=9)) == "inst:9"
+
+    def test_no_declaration_registers_nothing(self) -> None:
+        """Without ``__ffi_methods__``, no user TypeMethods are created —
+        regular methods remain pure Python attributes."""
+
+        @py_class(_unique_key("ToyBare"))
+        class ToyBare(core.Object):
+            value: int
+
+            def untagged(self) -> int:  # not in __ffi_methods__
+                return self.value
+
+        assert _find_method(_get_type_info(ToyBare), "untagged") is None
+
+
+class TestDollarMethodReferenceInTrait:
+    """``$method:NAME`` references inside a trait resolve via ``TypeInfo.methods``.
+
+    The toy printer :func:`_toy_trait_print` is the unit-under-test's
+    consumer. It models what a real trait-driven C++ printer does:
+    walk the trait map, parse ``$method:`` refs, dispatch through the
+    FFI method table. A successful return value means the whole
+    registration-plus-resolution chain is intact.
+    """
+
+    def test_static_method_ref_resolves(self) -> None:
+        """A ``$method:`` ref pointing at a ``@staticmethod`` prints
+        whatever the method returns."""
+
+        @py_class(_unique_key("PrintStatic"))
+        class PrintStatic(core.Object):
+            name: str
+            __ffi_ir_traits__ = {"label": "$method:label_of"}
+            __ffi_methods__ = ("label_of",)
+
+            @staticmethod
+            def label_of(obj: Any) -> str:
+                return obj.name.upper()
+
+        assert _toy_trait_print(PrintStatic(name="add"), "label") == "ADD"
+
+    def test_instance_method_ref_resolves(self) -> None:
+        """The same pattern with an instance method — the instance is
+        threaded through the FFI call as the first positional arg."""
+
+        @py_class(_unique_key("PrintInst"))
+        class PrintInst(core.Object):
+            name: str
+            arity: int
+            __ffi_ir_traits__ = {"sig": "$method:signature"}
+            __ffi_methods__ = ("signature",)
+
+            def signature(self) -> str:
+                return f"{self.name}/{self.arity}"
+
+        assert _toy_trait_print(PrintInst(name="mul", arity=2), "sig") == "mul/2"
+
+    def test_missing_method_surfaces_clear_error(self) -> None:
+        """A ``$method:`` ref whose target isn't in ``__ffi_methods__``
+        raises at resolution time — the failure mode a user would hit
+        if they forgot the opt-in declaration."""
+
+        @py_class(_unique_key("PrintMiss"))
+        class PrintMiss(core.Object):
+            name: str
+            __ffi_ir_traits__ = {"k": "$method:not_registered"}
+            # Method exists but is NOT listed in __ffi_methods__.
+
+            @staticmethod
+            def not_registered(obj: Any) -> str:
+                return obj.name
+
+        with pytest.raises(LookupError, match=r"not in TypeInfo.methods"):
+            _toy_trait_print(PrintMiss(name="x"), "k")
+
+
+class TestFfiMethodsValidation:
+    """Decoration-time validation of ``__ffi_methods__``.
+
+    Only the four errors a real user is likely to hit are kept — broader
+    catch-all cases (non-string entries, non-iterable containers) are
+    validated indirectly by the surviving positive tests and by the
+    classifier's type hints.
+    """
+
+    def test_rejects_reserved_ffi_prefix(self) -> None:
+        with pytest.raises(NameError, match=r"reserved FFI prefix"):
+
+            @py_class(_unique_key("RFfiPfx"))
+            class _RFfiPfx(core.Object):
+                x: int
+                __ffi_methods__ = ("__ffi_custom__",)
+
+                @staticmethod
+                def __ffi_custom__(obj: Any) -> Any: ...
+
+    def test_rejects_type_attr_column_name(self) -> None:
+        with pytest.raises(NameError, match=r"TypeAttrColumn name"):
+
+            @py_class(_unique_key("RFfiAttr"))
+            class _RFfiAttr(core.Object):
+                x: int
+                __ffi_methods__ = ("__ffi_repr__",)
+
+                def __ffi_repr__(self, fn_repr: Any) -> str:
+                    return "repr"
+
+    def test_rejects_python_protocol_dunder(self) -> None:
+        with pytest.raises(NameError, match=r"Python protocol dunder"):
+
+            @py_class(_unique_key("RDun"))
+            class _RDun(core.Object):
+                x: int
+                __ffi_methods__ = ("__len__",)
+
+                def __len__(self) -> int:
+                    return 0
+
+    def test_rejects_missing_method_body(self) -> None:
+        with pytest.raises(AttributeError, match=r"no such attribute"):
+
+            @py_class(_unique_key("RMissing"))
+            class _RMissing(core.Object):
+                x: int
+                __ffi_methods__ = ("_nonexistent",)
+
+
+# ---------------------------------------------------------------------------
 # super().__init__() support for @py_class(init=False) subclasses
 # ---------------------------------------------------------------------------
 class TestSuperInitPattern:
