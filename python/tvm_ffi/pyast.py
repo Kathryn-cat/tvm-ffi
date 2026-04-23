@@ -2339,10 +2339,47 @@ class FuncFrame(Frame):
 
 
 class ForFrame(Frame):
-    """Marker frame for a for-loop body. Pushed by every dialect's
-    ``__ffi_for_handler__`` so ``break`` / ``continue`` validation and
-    loop-carried-var tracking can query the enclosing loop context
-    without caring which dialect owns it."""
+    """Typed for-loop frame — doubles as:
+
+    1. The runtime value returned by ``T.serial(0, n)`` / ``T.parallel(...)`` /
+       ... iter factories before :meth:`IRParser.visit_for` runs.
+    2. The marker frame pushed while the loop body parses — cross-cutting
+       code queries ``isinstance(f, ForFrame)`` + ``f.kind`` to detect
+       "am I inside a loop of kind K?" regardless of which dialect owns
+       the loop.
+
+    Post ``design_docs/parser_for_handler_refactor.md``: this class
+    replaces the per-dialect ``_IterHolder`` / ``_ScfRange`` dataclasses
+    and the ``__ffi_for_handler__`` protocol. :meth:`IRParser.visit_for`
+    dispatches on ``isinstance(iter_val, ForFrame)`` directly and
+    builds ``for_cls(**frame_kwargs)``.
+    """
+
+    __slots__ = ()
+
+    def __init__(
+        self,
+        *,
+        for_cls: "type | None" = None,
+        kind: str = "serial",
+        start: Any = None,
+        end: Any = None,
+        step: Any = 1,
+        annotations: Any = None,
+        loop_var_ty: Any = None,
+        dialects: Sequence[Any] | None = None,
+        **data: Any,
+    ) -> None:
+        super().__init__(dialects=dialects)
+        self.for_cls = for_cls
+        self.kind = kind
+        self.start = start
+        self.end = end
+        self.step = step
+        self.annotations = annotations
+        self.loop_var_ty = loop_var_ty
+        if data:
+            self.__dict__.update(data)
 
 
 class IfFrame(Frame):
@@ -3023,18 +3060,145 @@ class IRParser:
         return (cond, then_body, else_body)
 
     def visit_for(self, node: For) -> Any:
-        """Parse ``for`` loop."""
+        """Parse ``for`` loop — direct dispatch on :class:`ForFrame`.
+
+        Post ``design_docs/parser_for_handler_refactor.md``: the iter
+        factory on the dialect (``T.serial(...)`` / ``scf.range(...)``)
+        returns a :class:`ForFrame` carrying ``for_cls`` plus the loop
+        bounds; :meth:`_dispatch_for_frame` builds the IR from it.
+        Plain ``range(...)`` falls through to the first active dialect
+        that declares an ``__ffi_range_default__`` iter factory.
+        """
         iter_val = self.eval_expr(node.rhs)
-        handler = getattr(type(iter_val), "__ffi_for_handler__", None)
-        if handler is not None:
-            return handler(iter_val, self, node)
-        hook = self._lookup_hook("for_stmt")
-        if hook is not None:
-            return hook(self, node, iter_val)
-        # Default fallback — visit body without binding the loop var.
-        with self.scoped_frame(), self.push_frame(ForFrame()):
+        if isinstance(iter_val, ForFrame):
+            return self._dispatch_for_frame(iter_val, node)
+        if isinstance(iter_val, range):
+            for dialect in self.active_dialects():
+                default = getattr(dialect, "__ffi_range_default__", None)
+                if default is None:
+                    continue
+                wrapped = default(
+                    iter_val.start, iter_val.stop, step=iter_val.step,
+                )
+                if isinstance(wrapped, ForFrame):
+                    return self._dispatch_for_frame(wrapped, node)
+            raise TypeError(
+                "for-loop with bare ``range(...)`` but no active dialect "
+                "declares ``__ffi_range_default__`` (the framework needs "
+                "a default iter-kind factory to build a ForFrame from "
+                "the range).",
+            )
+        raise TypeError(
+            f"visit_for: unsupported for-iter type "
+            f"{type(iter_val).__name__}. Expected a :class:`ForFrame` "
+            "(from ``T.serial(...)`` / ``scf.range(...)`` / etc.) or a "
+            "plain Python ``range``.",
+        )
+
+    def _dispatch_for_frame(self, frame: "ForFrame", node: "For") -> Any:
+        """Build ``frame.for_cls(**kwargs)`` after parsing the loop body.
+
+        Two passes:
+
+        1. Walk the IR class's ``ForTraits``; for each ``$field:`` slot
+           translate the frame's canonical attr (``start`` / ``end`` /
+           ``step`` / ``annotations``) onto the IR-declared field name.
+        2. For non-``$field:`` slots (``$global:`` / ``$method:``),
+           look up ``__ffi_parse_inverse__[slot_name]`` on the IR
+           class (see ``design_docs/parser_for_handler_refactor.md``
+           §7) and merge the method's return-dict into the build
+           kwargs. Inverses receive a :class:`ParseContext` as their
+           first argument and may also mutate ``ctx.frame`` directly.
+        """
+        from tvm_ffi import ir_traits as _tr  # noqa: PLC0415
+        from tvm_ffi.pyast_trait_parse import (  # noqa: PLC0415
+            ParseContext,
+            _field_from_ref,
+            parse_value_def,
+            resolve_slot_inverse,
+        )
+
+        if not isinstance(node.lhs, Id):
+            raise NotImplementedError(
+                "visit_for: only ``Id`` loop targets are supported "
+                f"(got {type(node.lhs).__name__}).",
+            )
+        if frame.for_cls is None:
+            raise RuntimeError(
+                "visit_for: ForFrame has no ``for_cls`` — the iter "
+                "factory must set it (e.g. ``T.serial`` factory "
+                "produced by ``finalize_module``).",
+            )
+
+        trait = getattr(frame.for_cls, "__ffi_ir_traits__", None)
+        if not isinstance(trait, _tr.ForTraits):
+            raise TypeError(
+                f"visit_for: {frame.for_cls.__name__} has no ForTraits; "
+                "cannot build via ForFrame dispatch.",
+            )
+
+        loop_var_ty = (
+            frame.loop_var_ty
+            or self._lookup_hook("__ffi_default_int_ty__")
+        )
+        make_var = self._lookup_hook("__ffi_make_var__")
+
+        loop_var_field = (
+            _field_from_ref(trait.region.def_values) or "loop_var"
+        )
+        body_field = _field_from_ref(trait.region.body) or "body"
+
+        with self.scoped_frame(), self.push_frame(frame):
+            loop_var = parse_value_def(
+                self, node.lhs.name, annotation=None,
+                make_var=make_var, default_ty=loop_var_ty,
+            )
             body = self.visit_body(node.body)
-        return (node.lhs, iter_val, body)
+
+        ctx = ParseContext(parser=self, frame=frame, ir_class=frame.for_cls)
+        build_kwargs: dict[str, Any] = {
+            loop_var_field: loop_var,
+            body_field: body,
+        }
+
+        # Canonical ForFrame attr names for each trait slot.
+        _slot_to_frame_attr = {
+            "start": "start",
+            "end": "end",
+            "step": "step",
+            "attrs": "annotations",
+        }
+        for slot_name, frame_attr in _slot_to_frame_attr.items():
+            ref = getattr(trait, slot_name, None)
+            if not isinstance(ref, str):
+                continue
+            slot_value = getattr(frame, frame_attr, None)
+            ir_field = _field_from_ref(ref)
+            if ir_field is not None:
+                build_kwargs[ir_field] = slot_value
+            else:
+                overrides = resolve_slot_inverse(ctx, slot_name, slot_value)
+                build_kwargs.update(overrides)
+
+        # ``kind`` is a regular IR field on some dialects (mini.tir.For);
+        # forward it from the frame when the class declares it.
+        declared = set(getattr(frame.for_cls, "__annotations__", {}))
+        info = getattr(frame.for_cls, "__tvm_ffi_type_info__", None)
+        if info is not None:
+            declared.update(f.name for f in info.fields)
+        if "kind" in declared and "kind" not in build_kwargs:
+            build_kwargs["kind"] = frame.kind
+
+        # Extra attrs a parse-hook wrote onto ``frame.__dict__`` during
+        # body parse (and that name declared IR fields) flow in too —
+        # useful when a trait for-class has fields beyond the five
+        # canonical slots.
+        for k, v in frame.__dict__.items():
+            if k in build_kwargs or k not in declared:
+                continue
+            build_kwargs[k] = v
+
+        return frame.for_cls(**build_kwargs)
 
     def visit_with(self, node: With) -> Any:
         """Parse ``with`` stmt. Looks up ``with_stmt`` hook on language modules."""

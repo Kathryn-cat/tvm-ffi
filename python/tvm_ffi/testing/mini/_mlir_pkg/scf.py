@@ -16,16 +16,16 @@
 # under the License.
 """Mini-MLIR ``scf`` dialect — structured control flow.
 
-Exposes ``scf.range(lb, ub, step)`` which returns a :class:`_ScfRange`
-iter holder (auto-wired ``__ffi_for_handler__``); ``visit_for``
-dispatches through the holder's handler.
+Exposes ``scf.range(lb, ub, step)`` — an auto-wired
+:class:`~tvm_ffi.pyast.ForFrame` factory. ``visit_for`` dispatches on
+the frame directly; no ``__ffi_for_handler__`` protocol, no per-dialect
+iter-holder dataclass. See ``design_docs/parser_for_handler_refactor.md``.
 """
 
 # ruff: noqa: A003, D102, N802, UP006, UP045
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, List  # noqa: UP035
 
 from tvm_ffi import Object
@@ -45,7 +45,13 @@ from .arith import IntegerType
 
 @py_class("mini.mlir.ScfForOp", structural_eq="tree")
 class ScfForOp(Object):
-    """``for i in scf.range(lb, ub, step): body`` — scf.for."""
+    """``for i in scf.range(lb, ub, step): body`` — scf.for.
+
+    ``_loop_var_ty`` is read by the auto-generated ``scf.range`` iter
+    factory (built by :func:`finalize_module`) so the loop induction
+    variable is typed as ``index`` regardless of the ambient
+    ``__ffi_default_int_ty__``.
+    """
 
     __ffi_ir_traits__ = tr.ForTraits(
         tr.RegionTraits("$field:body", "$field:iv", None, None),
@@ -57,6 +63,8 @@ class ScfForOp(Object):
     ub: Any
     step: Any
     body: List[Any]
+
+    _loop_var_ty = IntegerType(name="index")
 
 
 @py_class("mini.mlir.ScfIfOp", structural_eq="tree")
@@ -74,69 +82,20 @@ class ScfIfOp(Object):
 
 
 # ============================================================================
-# Bucket C — iter-holder dataclass for ``scf.range(...)``
-#
-# ``finalize_module`` injects ``__ffi_for_handler__`` via
-# ``iter_holder=_ScfRange`` + ``iter_kinds=["range"]``.
-# ============================================================================
-
-
-@dataclass
-class _ScfRange:
-    """Iter object for ``for i in scf.range(...)``.
-
-    The ``_loop_var_ty`` class attribute signals to the auto-wired
-    :meth:`__ffi_for_handler__` that the loop induction variable is
-    typed as ``index`` regardless of ambient ``__ffi_default_int_ty__``
-    — mirrors MLIR's scf.for convention.
-    """
-
-    lb: Any
-    ub: Any
-    step: Any
-
-    _loop_var_ty = IntegerType(name="index")
-
-
-# ============================================================================
-# Bucket C — var-construction hook + range factory
-#
-# ``range`` is a builtin we override; the auto-wiring would normally
-# produce it from ``iter_kinds=["range"]`` but we define it explicitly
-# to keep the signature shape identical across call sites.
+# Bucket C — var-construction hook
 # ============================================================================
 
 
 __ffi_make_var__ = staticmethod(_make_value)
 
 
-def range(*args: Any, step: Any = None) -> _ScfRange:  # noqa: A001
-    """``scf.range(...)`` — iter-holder factory supporting 1/2/3 positional args."""
-    if len(args) == 1:
-        lb, ub = 0, args[0]
-    elif len(args) == 2:
-        lb, ub = args
-    elif len(args) == 3:
-        lb, ub, step_pos = args
-        if step is not None and step != step_pos:
-            raise TypeError("scf.range: positional and kw step disagree")
-        step = step_pos
-    else:
-        raise TypeError(
-            f"scf.range: expected 1/2/3 positional args, got {len(args)}",
-        )
-    return _ScfRange(lb=lb, ub=ub, step=1 if step is None else step)
-
-
 # ============================================================================
 # The single finalize_module call — auto-injects:
 #
 # * ``if_stmt`` hook (IfTraits) → builds :class:`ScfIfOp`.
-# * ``__ffi_for_handler__`` on :class:`_ScfRange` (ForTraits) — uses
-#   the ``iter_holder=`` config to attach the handler.
-# * Does NOT auto-generate ``range`` — we defined it above explicitly
-#   so the ``hasattr`` guard skips the generic factory generator. Our
-#   explicit ``range`` has the same shape as the auto-generated one.
+# * ``scf.range`` iter factory (from ``iter_kinds=["range"]``) returning
+#   a :class:`~tvm_ffi.pyast.ForFrame` carrying ``for_cls=ScfForOp`` and
+#   ``loop_var_ty=IntegerType("index")``.
 # ============================================================================
 
 
@@ -144,5 +103,4 @@ finalize_module(
     __name__,
     prefix="scf",
     iter_kinds=["range"],
-    iter_holder=_ScfRange,
 )

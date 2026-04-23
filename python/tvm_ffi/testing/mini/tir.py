@@ -380,32 +380,59 @@ class AssertStmt(Object):
 
 
 # ----------------------------------------------------------------------------
-# For — kind resolved via a global. Kinds themselves live in a
-# class-level dtype and are looked up at print time.
+# For — two slots use ``$global:``:
+#
+# * ``text_printer_kind`` is auto-registered by the framework (emits
+#   ``T.{obj.kind}``; see :func:`_maybe_install_kind_resolver`).
+# * ``end`` stores as ``extent`` internally but the printer re-emits it
+#   as ``end = start + extent`` so source text sees the friendlier
+#   3-arg ``T.serial(start, end, step)`` form. The parser side uses
+#   ``__ffi_parse_inverse__`` to run the reverse transform —
+#   demonstration fixture for design_docs/parser_for_handler_refactor.md
+#   §7.2.
 # ----------------------------------------------------------------------------
 
 
-@register_global_func("mini.tir._for_kind_prefix")
-def _for_kind_prefix_global(_printer: Any, obj: Any) -> str:
-    return f"T.{obj.kind}"
+@register_global_func("mini.tir._compute_end")
+def _compute_end_global(_printer: Any, obj: Any) -> Any:
+    """``end`` printer hook: ``obj.start + obj.extent`` → the dispatched
+    ``end`` value the printer emits as the middle arg of
+    ``T.serial(start, end, step)``."""
+    return obj.start + obj.extent
 
 
 @py_class("mini.tir.For", structural_eq="tree")
 class For(Object):
+    """Loop IR. Stores the span as ``extent`` (length, not endpoint) so
+    downstream passes can scale it without reconstructing ``end``; the
+    printer re-derives ``end = start + extent`` via
+    ``$global:mini.tir._compute_end`` and the parser inverts with
+    ``__ffi_parse_inverse__["end"] → _decompose_end``.
+    """
+
     __ffi_ir_traits__ = tr.ForTraits(
         tr.RegionTraits("$field:body", "$field:loop_var", None, None),
-        "$field:start", "$field:end", "$field:step",
+        "$field:start", "$global:mini.tir._compute_end", "$field:step",
         None, None,
         "$field:annotations",
         "$global:mini.tir._for_kind_prefix",
     )
+    __ffi_parse_inverse__ = {"end": "_decompose_end"}
     loop_var: Var = dc_field(structural_eq="def")
     start: Any
-    end: Any
+    extent: Any
     step: Any
     body: List[Any]
     kind: str = "serial"
     annotations: Optional[Any] = None
+
+    @staticmethod
+    def _decompose_end(ctx: Any, end_value: Any) -> dict:
+        """Parser inverse for the ``end`` slot: given the printed
+        ``T.serial(start, end, step)``'s middle arg, store
+        ``extent = end - start`` so the IR round-trips."""
+        start = ctx.frame.start
+        return {"extent": end_value - start}
 
 
 @py_class("mini.tir.Block", structural_eq="tree")
@@ -513,23 +540,13 @@ class PrimFunc(Object):
 
 
 # ============================================================================
-# Bucket C — iter-holder / with-marker dataclasses
+# Bucket C — with-marker dataclass
 #
-# ``finalize_module`` injects ``__ffi_for_handler__`` / ``__ffi_with_handler__``
-# onto these classes during auto-wiring (category-C frame pushes happen
-# inside the generated methods).
+# The iter-holder dataclass is gone — ``T.serial(...)`` etc. return a
+# typed :class:`~tvm_ffi.pyast.ForFrame` directly (see
+# ``design_docs/parser_for_handler_refactor.md``). Only ``T.block()``
+# still needs its own marker class.
 # ============================================================================
-
-
-@dataclass
-class _IterHolder:
-    """Runtime value returned by ``T.serial(...)`` / ``T.parallel(...)`` etc."""
-
-    kind: str
-    start: Any
-    end: Any
-    step: Any
-    annotations: Optional[Any] = None
 
 
 @dataclass
@@ -644,7 +661,6 @@ finalize_module(
     __name__,
     prefix="T",
     iter_kinds=["serial", "parallel", "unroll", "vectorized"],
-    iter_holder=_IterHolder,
     with_marker=_BlockMarker,
     # ``dtypes`` / ``default_dtypes`` default to the FFI-standard set —
     # see ``design_docs/parser_dtype_defaults_refactor.md``. Mini-TIR

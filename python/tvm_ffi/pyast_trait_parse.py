@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from tvm_ffi import ir_traits as tr
@@ -25,10 +26,79 @@ from tvm_ffi import pyast
 from tvm_ffi.core import _lookup_type_attr
 
 if TYPE_CHECKING:
-    from tvm_ffi.pyast import IRParser
+    from tvm_ffi.pyast import Frame, IRParser
 
 
 _SENTINEL = object()
+
+
+# ============================================================================
+# ParseContext — shared first-arg for ``__ffi_parse_inverse__`` /
+# ``__ffi_parse_hooks__`` methods. See
+# ``design_docs/parser_for_handler_refactor.md`` §7.1.
+# ============================================================================
+
+
+@dataclass
+class ParseContext:
+    """First-argument passed to user-defined ``__ffi_parse_inverse__``
+    slot methods and ``__ffi_parse_hooks__`` frame mutators.
+
+    Three attributes — no hidden API. The handler reads / writes
+    ``ctx.frame.__dict__`` directly; those attributes flow into the
+    final ``ir_class(**frame.__dict__)`` build call.
+    """
+
+    parser: "IRParser"
+    frame: "Frame"
+    ir_class: type
+
+
+# ============================================================================
+# __ffi_parse_inverse__ — per-trait-slot inverses for $global: / $method:
+# slots. See design doc §7.2.
+# ============================================================================
+
+
+def resolve_slot_inverse(
+    ctx: ParseContext, slot_name: str, slot_value: Any,
+) -> dict[str, Any]:
+    """Invoke ``ir_class.__ffi_parse_inverse__[slot_name]`` on ``slot_value``.
+
+    Returns the dict of field overrides the inverse method produced
+    (may be empty — the method is allowed to mutate ``ctx.frame``
+    directly and return :data:`None`).
+
+    Raises :class:`KeyError` with a clear message when the slot isn't
+    in the class's inverse map — this is the "loud error" called for in
+    design doc §7.4.
+    """
+    inverse_map = getattr(ctx.ir_class, "__ffi_parse_inverse__", None)
+    method_name = None
+    if isinstance(inverse_map, dict):
+        method_name = inverse_map.get(slot_name)
+    if method_name is None:
+        raise KeyError(
+            f"{ctx.ir_class.__name__}.__ffi_parse_inverse__[{slot_name!r}] "
+            "not found. A trait slot that is ``$global:`` / ``$method:`` "
+            "needs an inverse method — declare it in the "
+            "``__ffi_parse_inverse__`` dict on the IR class.",
+        )
+    method = getattr(ctx.ir_class, method_name, None)
+    if method is None:
+        raise AttributeError(
+            f"{ctx.ir_class.__name__}.__ffi_parse_inverse__[{slot_name!r}] "
+            f"refs method {method_name!r} that doesn't exist on the class.",
+        )
+    result = method(ctx, slot_value)
+    if result is None:
+        return {}
+    if not isinstance(result, dict):
+        raise TypeError(
+            f"{ctx.ir_class.__name__}.{method_name}: expected dict or "
+            f"None return, got {type(result).__name__}.",
+        )
+    return result
 
 
 # ============================================================================

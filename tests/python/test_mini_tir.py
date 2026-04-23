@@ -1082,7 +1082,7 @@ def test_t4_for_each_kind(kind):
     i = _v("i")
     func = _wrap(
         [mt.For(
-            loop_var=i, start=0, end=10, step=1,
+            loop_var=i, start=0, extent=10, step=1,
             body=[mt.BufferStore(buffer=A, value=_int(1), indices=[i])],
             kind=kind,
         )],
@@ -1099,7 +1099,7 @@ def test_t4_for_with_non_default_step():
     i = _v("i")
     func = _wrap(
         [mt.For(
-            loop_var=i, start=0, end=10, step=2,
+            loop_var=i, start=0, extent=10, step=2,
             body=[mt.BufferStore(buffer=A, value=_int(1), indices=[i])],
             kind="serial",
         )],
@@ -1114,7 +1114,7 @@ def test_t4_for_with_annotations():
     i = _v("i")
     func = _wrap(
         [mt.For(
-            loop_var=i, start=0, end=10, step=1,
+            loop_var=i, start=0, extent=10, step=1,
             body=[mt.BufferStore(buffer=A, value=_int(1), indices=[i])],
             kind="parallel",
             annotations={"unroll_factor": 4},
@@ -1201,12 +1201,12 @@ def test_t5_for_in_for():
     A = _v("A", "int32")
     i, j = _v("i"), _v("j")
     inner = mt.For(
-        loop_var=j, start=0, end=10, step=1,
+        loop_var=j, start=0, extent=10, step=1,
         body=[mt.BufferStore(buffer=A, value=j, indices=[i])],
         kind="serial",
     )
     outer = mt.For(
-        loop_var=i, start=0, end=10, step=1,
+        loop_var=i, start=0, extent=10, step=1,
         body=[inner], kind="serial",
     )
     func = _wrap([outer], params=[A])
@@ -1225,7 +1225,7 @@ def test_t5_if_in_for():
     )
     func = _wrap(
         [mt.For(
-            loop_var=i, start=0, end=10, step=1,
+            loop_var=i, start=0, extent=10, step=1,
             body=[if_stmt], kind="serial",
         )],
         params=[A],
@@ -1257,7 +1257,7 @@ def test_t5_block_in_for():
     i = _v("i")
     func = _wrap(
         [mt.For(
-            loop_var=i, start=0, end=10, step=1,
+            loop_var=i, start=0, extent=10, step=1,
             body=[mt.Block(body=[
                 mt.BufferStore(buffer=A, value=_int(1), indices=[i]),
             ])],
@@ -1279,7 +1279,7 @@ def test_t5_for_in_while_in_if():
             then_body=[mt.While(
                 cond=cond,
                 body=[mt.For(
-                    loop_var=i, start=0, end=10, step=1,
+                    loop_var=i, start=0, extent=10, step=1,
                     body=[mt.BufferStore(buffer=A, value=_int(1), indices=[i])],
                     kind="serial",
                 )],
@@ -1383,9 +1383,9 @@ def test_t6_primfunc_deep_nesting():
         then_body=[mt.IfThenElse(
             cond=b,
             then_body=[mt.For(
-                loop_var=i, start=0, end=10, step=1,
+                loop_var=i, start=0, extent=10, step=1,
                 body=[mt.For(
-                    loop_var=j, start=0, end=10, step=1,
+                    loop_var=j, start=0, extent=10, step=1,
                     body=[mt.BufferStore(buffer=A, value=_int(1), indices=[i])],
                     kind="serial",
                 )],
@@ -1517,6 +1517,72 @@ def test_find_frame_raises_outside_function_body():
 
 
 # ============================================================================
+# __ffi_parse_inverse__: ``$global:`` slot on mini.tir.For
+#
+# mini.tir.For stores ``extent`` (length) instead of ``end`` (endpoint).
+# The trait's ``end`` slot is ``"$global:mini.tir._compute_end"`` — the
+# printer emits ``start + extent`` as the middle arg of
+# ``T.serial(start, end, step)``, and ``__ffi_parse_inverse__["end"] →
+# _decompose_end`` inverts the arithmetic at parse time
+# (``extent = end - start``). Covers ``design_docs/parser_for_handler_refactor.md``
+# §7.2.
+# ============================================================================
+
+
+def test_inverse_for_end_slot_roundtrips_via_extent():
+    """``for i in T.serial(0, 10, 1)`` round-trips with ``extent=10``
+    via the ``$global:`` printer + ``__ffi_parse_inverse__`` parser."""
+    A = _v("A", "int32")
+    i = _v("i")
+    loop = mt.For(
+        loop_var=i, start=0, extent=10, step=1,
+        body=[mt.BufferStore(buffer=A, value=_int(0), indices=[i])],
+        kind="serial",
+    )
+    func = _wrap([loop], params=[A])
+    text = pyast.to_python(func)
+    assert "T.serial(" in text
+    _rt(func)
+
+
+def test_inverse_for_nonzero_start_computes_extent_correctly():
+    """Non-zero start stresses the ``extent = end - start`` subtraction
+    — parsed loop must store ``extent = end - start``, not ``extent = end``."""
+    A = _v("A", "int32")
+    i = _v("i")
+    # orig: start=2, extent=8 → printer emits end = 2 + 8 = 10
+    loop = mt.For(
+        loop_var=i, start=2, extent=8, step=1,
+        body=[mt.BufferStore(buffer=A, value=_int(0), indices=[i])],
+        kind="serial",
+    )
+    func = _wrap([loop], params=[A])
+    _rt(func)
+
+
+def test_inverse_for_parse_direct_text():
+    """Parse a ``T.serial(start, end, step)`` directly from source
+    text and assert the resulting IR has the right ``extent``."""
+    text = (
+        "@T.prim_func\n"
+        "def test_func(A: T.int32):\n"
+        "  for i in T.serial(3, 11, 1):\n"
+        "    A[i] = 0\n"
+    )
+    parser = pyast.IRParser(
+        lang_modules=mt.LANG_MODULES, var_factory=mt.make_var_factory,
+    )
+    [parsed] = parser.parse(text)
+    for_node = parsed.body[0]
+    assert isinstance(for_node, mt.For)
+    assert for_node.start == 3
+    # ``extent`` should be ``end - start`` = 11 - 3 = 8, set by
+    # ``For._decompose_end``.
+    assert for_node.extent == 8
+    assert for_node.step == 1
+
+
+# ============================================================================
 # Tier 7 — Modules
 # ============================================================================
 
@@ -1575,7 +1641,7 @@ def test_t8_buffer_init_loop():
     i = _v("i")
     func = _wrap(
         [mt.For(
-            loop_var=i, start=0, end=128, step=1,
+            loop_var=i, start=0, extent=128, step=1,
             body=[mt.BufferStore(buffer=A, value=_int(0), indices=[i])],
             kind="serial",
         )],
@@ -1590,7 +1656,7 @@ def test_t8_vector_add_pattern():
     i = _v("i")
     func = _wrap(
         [mt.For(
-            loop_var=i, start=0, end=64, step=1,
+            loop_var=i, start=0, extent=64, step=1,
             body=[mt.BufferStore(
                 buffer=C,
                 value=mt.Add(
@@ -1613,7 +1679,7 @@ def test_t8_predicated_compute():
     i = _v("i")
     func = _wrap(
         [mt.For(
-            loop_var=i, start=0, end=32, step=1,
+            loop_var=i, start=0, extent=32, step=1,
             body=[mt.IfThenElse(
                 cond=cond,
                 then_body=[mt.BufferStore(
@@ -1636,9 +1702,9 @@ def test_t8_nested_loop_2d_init():
     i, j = _v("i"), _v("j")
     func = _wrap(
         [mt.For(
-            loop_var=i, start=0, end=8, step=1,
+            loop_var=i, start=0, extent=8, step=1,
             body=[mt.For(
-                loop_var=j, start=0, end=8, step=1,
+                loop_var=j, start=0, extent=8, step=1,
                 body=[mt.BufferStore(
                     buffer=A,
                     value=mt.Add(lhs=i, rhs=j),
@@ -1662,7 +1728,7 @@ def test_t8_assert_guarded_loop():
         [
             mt.AssertStmt(cond=cond, message="bounds check"),
             mt.For(
-                loop_var=i, start=0, end=16, step=1,
+                loop_var=i, start=0, extent=16, step=1,
                 body=[mt.BufferStore(buffer=A, value=i, indices=[i])],
                 kind="serial",
             ),
@@ -1686,7 +1752,7 @@ def test_t8_module_with_two_kernels():
         name="init",
         params=[A_init],
         body=[mt.For(
-            loop_var=i_init, start=0, end=16, step=1,
+            loop_var=i_init, start=0, extent=16, step=1,
             body=[mt.BufferStore(buffer=A_init, value=_int(0), indices=[i_init])],
             kind="serial",
         )],
@@ -1697,7 +1763,7 @@ def test_t8_module_with_two_kernels():
         name="compute",
         params=[A_compute],
         body=[mt.For(
-            loop_var=i_compute, start=0, end=16, step=1,
+            loop_var=i_compute, start=0, extent=16, step=1,
             body=[mt.BufferStore(
                 buffer=A_compute,
                 value=mt.Add(

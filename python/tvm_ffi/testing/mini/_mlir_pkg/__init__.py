@@ -77,7 +77,7 @@ from .arith import (
 from .builtin import ModuleOp
 from .func import CallOp, FuncOp, ReturnOp
 from .memref import LoadOp, MemRefType, StoreOp
-from .scf import ScfForOp, ScfIfOp, _ScfRange
+from .scf import ScfForOp, ScfIfOp
 from .vector import VectorAddOp, VectorType
 
 

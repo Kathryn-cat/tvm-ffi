@@ -39,10 +39,32 @@ class ScfIfOp(Object):
 
 # ===== Factories / hooks =====
 
-def for_stmt(parser: Any, node: Any, iter_val: Any) -> Any: ...
+def __ffi_range_default__(*args: Any, step: Any = ..., annotations: Any = ...) -> 'pyast.ForFrame': ...
 def if_stmt(_parser: Any, cond: Any, then_body: list, else_body: list) -> Any: ...
-def range(*args: Any, step: Any = ...) -> _ScfRange: ...
+def range(*args: Any, step: Any = ..., annotations: Any = ...) -> 'pyast.ForFrame': ...
 
 # ===== Dtype handles & module metadata =====
 
+__ffi_default_bool_ty__: _DtypeHandle
+__ffi_default_float_ty__: _DtypeHandle
+__ffi_default_int_ty__: _DtypeHandle
 __ffi_parsers__: dict[Any, Any]
+bfloat16: _DtypeHandle
+bool: _DtypeHandle
+float16: _DtypeHandle
+float32: _DtypeHandle
+float4_e2m1fnx2: _DtypeHandle
+float64: _DtypeHandle
+float8_e4m3fn: _DtypeHandle
+float8_e4m3fnuz: _DtypeHandle
+float8_e5m2: _DtypeHandle
+float8_e5m2fnuz: _DtypeHandle
+float8_e8m0fnu: _DtypeHandle
+int16: _DtypeHandle
+int32: _DtypeHandle
+int64: _DtypeHandle
+int8: _DtypeHandle
+uint16: _DtypeHandle
+uint32: _DtypeHandle
+uint64: _DtypeHandle
+uint8: _DtypeHandle

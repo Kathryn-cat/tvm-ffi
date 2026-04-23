@@ -78,5 +78,4 @@ from ._mlir_pkg import (
     SubIOp,
     VectorAddOp,
     VectorType,
-    _ScfRange,
 )

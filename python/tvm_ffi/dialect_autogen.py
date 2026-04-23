@@ -493,131 +493,57 @@ def _wire_func(module: "ModuleType", cls: type, trait: Any, ctx: dict) -> None:
 
 @_wiring_rule(tr.ForTraits)
 def _wire_for(module: "ModuleType", cls: type, trait: Any, ctx: dict) -> None:
-    """Register ``__ffi_for_handler__`` on the iter-holder dataclass +
-    per-kind iter factories on the module.
+    """Install per-kind iter factories + ``__ffi_range_default__`` +
+    auto-register a default ``$global:`` kind-prefix resolver.
 
-    Emits a **Category-C frame push** (``ForFrame(kind=self.kind)``)
-    inside the auto-generated handler so cross-cutting code can detect
-    "am I inside a for-loop of kind K?" via ``isinstance(f, ForFrame)``
-    plus ``f.kind``.
-
-    Requires ``iter_holder=...`` and ``iter_kinds=[...]`` config in
-    :func:`finalize_module`. Silently skips when either is missing.
+    Post ``design_docs/parser_for_handler_refactor.md``: the per-
+    dialect ``_IterHolder`` dataclass and ``__ffi_for_handler__``
+    protocol are gone. Iter factories return a typed
+    :class:`pyast.ForFrame`; :meth:`IRParser.visit_for` dispatches on
+    ``isinstance(iter_val, ForFrame)`` and builds the IR from
+    ``frame.for_cls``. Silently skips when no ``iter_kinds=[...]``
+    were passed — a dialect can have a ForTraits IR class without
+    source-level sugar factories.
     """
-    from tvm_ffi.pyast_trait_parse import parse_value_def  # noqa: PLC0415
-
-    iter_holder = ctx.get("iter_holder")
     iter_kinds = ctx.get("iter_kinds") or []
-    if iter_holder is None or not iter_kinds:
-        return
-
-    loop_var_field = _strip_field_prefix(trait.region.def_values) or "loop_var"
-    body_field = _strip_field_prefix(trait.region.body) or "body"
-    start_field = _strip_field_prefix(trait.start) if trait.start else None
-    end_field = _strip_field_prefix(trait.end) if trait.end else None
-    step_field = _strip_field_prefix(trait.step) if trait.step else None
-    ann_field = _strip_field_prefix(trait.attrs) if trait.attrs else None
-
-    def _make_handler(_cls: type = cls) -> Callable:
-        def _handler(self_holder: Any, parser: Any, node: Any) -> Any:
-            if not isinstance(node.lhs, pyast.Id):
-                raise NotImplementedError(
-                    "auto-generated For handler: only ``Id`` loop targets supported",
-                )
-            # Loop-var type resolution priority:
-            # 1. Holder-class attribute ``_loop_var_ty`` (scf.for uses
-            #    ``IntegerType(name="index")`` regardless of ambient
-            #    default-int-ty).
-            # 2. Module's own ``__ffi_default_int_ty__``.
-            # 3. Cross-dialect ``_lookup_hook("__ffi_default_int_ty__")``
-            #    — picks up e.g. ``arith.i32`` for a scf frame that
-            #    doesn't own its own scalar defaults.
-            default_int_ty = (
-                getattr(type(self_holder), "_loop_var_ty", None)
-                or getattr(module, "__ffi_default_int_ty__", None)
-                or parser._lookup_hook("__ffi_default_int_ty__")
-            )
-            make_var = (
-                getattr(module, "__ffi_make_var__", None)
-                or parser._lookup_hook("__ffi_make_var__")
-            )
-            with parser.scoped_frame(), parser.push_frame(
-                pyast.ForFrame(kind=getattr(self_holder, "kind", None)),
-            ):
-                loop_var = parse_value_def(
-                    parser,
-                    node.lhs.name,
-                    annotation=None,
-                    make_var=make_var,
-                    default_ty=default_int_ty,
-                )
-                body = parser.visit_body(node.body)
-            kwargs: dict[str, Any] = {
-                loop_var_field: loop_var,
-                body_field: body,
-            }
-            # Pull bounds off the holder using the IR class's own field
-            # names first (holders that mirror the IR class field names
-            # are the common case — e.g. mini.mlir's ``_ScfRange(lb, ub,
-            # step)`` maps directly onto ``ScfForOp(lb, ub, step)``).
-            # Fall back to the canonical ``start``/``end``/``step`` names
-            # for holders like mini.tir's ``_IterHolder(start, end, step)``
-            # that used the canonical vocabulary.
-            if start_field:
-                kwargs[start_field] = getattr(
-                    self_holder, start_field,
-                    getattr(self_holder, "start", None),
-                )
-            if end_field:
-                kwargs[end_field] = getattr(
-                    self_holder, end_field,
-                    getattr(self_holder, "end", None),
-                )
-            if step_field:
-                kwargs[step_field] = getattr(
-                    self_holder, step_field,
-                    getattr(self_holder, "step", None),
-                )
-            if ann_field:
-                kwargs[ann_field] = getattr(
-                    self_holder, ann_field,
-                    getattr(self_holder, "annotations", None),
-                )
-            if hasattr(self_holder, "kind") and "kind" in _class_field_names(_cls):
-                kwargs["kind"] = self_holder.kind
-            return _cls(**kwargs)
-
-        return _handler
-
-    if not hasattr(iter_holder, "__ffi_for_handler__"):
-        iter_holder.__ffi_for_handler__ = _make_handler()
-
     for kind_name in iter_kinds:
         if not hasattr(module, kind_name):
-            setattr(module, kind_name, _make_iter_factory(kind_name, iter_holder))
+            setattr(module, kind_name, _make_iter_factory(kind_name, cls))
 
-    # Plain Python ``range`` fallback — assume the first iter_kind is
-    # the default (``serial`` for TIR).
-    if iter_kinds and not hasattr(module, "for_stmt"):
-        default_kind = iter_kinds[0]
-        holder_cls = iter_holder
+    # First iter kind is the ``range(...)`` fallback default — stored
+    # as ``__ffi_range_default__`` so ``visit_for`` can find it via
+    # ordinary active-dialect lookup.
+    if iter_kinds and not hasattr(module, "__ffi_range_default__"):
+        module.__ffi_range_default__ = getattr(module, iter_kinds[0])
 
-        def _for_stmt_fallback(parser: Any, node: Any, iter_val: Any) -> Any:
-            if isinstance(iter_val, holder_cls):
-                return iter_val.__ffi_for_handler__(parser, node)
-            if isinstance(iter_val, range):
-                rng = holder_cls(
-                    kind=default_kind,
-                    start=iter_val.start,
-                    end=iter_val.stop,
-                    step=iter_val.step,
-                )
-                return rng.__ffi_for_handler__(parser, node)
-            raise TypeError(
-                f"Unsupported for-iter: {type(iter_val).__name__}",
-            )
+    # Auto-install the printer's ``$global:`` kind-prefix resolver if
+    # the trait references one that's not already registered.
+    _maybe_install_kind_resolver(module, trait, ctx)
 
-        module.for_stmt = _for_stmt_fallback  # type: ignore[attr-defined]
+
+def _maybe_install_kind_resolver(
+    module: "ModuleType", trait: Any, ctx: dict,
+) -> None:
+    """Auto-register a default ``f"{prefix}.{obj.kind}"`` resolver for
+    a ``$global:`` ``text_printer_kind`` ref when the user didn't
+    supply one. Keeps the IR-trait line verbatim, just removes the
+    boilerplate resolver on every dialect.
+    """
+    ref = getattr(trait, "text_printer_kind", None)
+    if not isinstance(ref, str) or not ref.startswith("$global:"):
+        return
+    global_name = ref[len("$global:"):]
+    from tvm_ffi import get_global_func, register_global_func  # noqa: PLC0415
+
+    if get_global_func(global_name, allow_missing=True) is not None:
+        return  # user-supplied resolver wins
+
+    prefix = ctx.get("prefix", "T")
+
+    def _default_resolver(_printer: Any, obj: Any, _prefix: str = prefix) -> str:
+        return f"{_prefix}.{obj.kind}"
+
+    register_global_func(global_name)(_default_resolver)
 
 
 @_wiring_rule(tr.WithTraits)
@@ -735,10 +661,19 @@ def _cls_name_safe(cls: type) -> str:
     return "".join(c if c.isalnum() else "_" for c in cls.__name__)
 
 
-def _make_iter_factory(kind: str, iter_holder: type) -> Callable:
-    """Build a ``T.<kind>(lb, ub, step, annotations=...)`` factory."""
+def _make_iter_factory(kind: str, for_cls: type) -> Callable:
+    """Build a ``T.<kind>(lb, ub, step, annotations=...)`` factory that
+    returns a typed :class:`~tvm_ffi.pyast.ForFrame`.
 
-    def factory(*args: Any, step: Any = None, annotations: Any = None) -> Any:
+    ``loop_var_ty`` comes from ``for_cls._loop_var_ty`` when the IR
+    class declares it (e.g. ``ScfForOp._loop_var_ty = IntegerType("index")``);
+    otherwise left :data:`None` and ``visit_for`` falls back to the
+    ambient ``__ffi_default_int_ty__`` hook.
+    """
+
+    def factory(
+        *args: Any, step: Any = None, annotations: Any = None,
+    ) -> "pyast.ForFrame":
         if len(args) == 1:
             start_v, end_v = 0, args[0]
         elif len(args) == 2:
@@ -752,12 +687,14 @@ def _make_iter_factory(kind: str, iter_holder: type) -> Callable:
             raise TypeError(
                 f"{kind}: expected 1/2/3 positional args, got {len(args)}",
             )
-        return iter_holder(
+        return pyast.ForFrame(
+            for_cls=for_cls,
             kind=kind,
             start=start_v,
             end=end_v,
             step=1 if step is None else step,
             annotations=annotations,
+            loop_var_ty=getattr(for_cls, "_loop_var_ty", None),
         )
 
     factory.__name__ = kind
@@ -871,7 +808,6 @@ def finalize_module(
     iter_kinds: Optional[list[str]] = None,
     dtypes: Optional[list[str]] = None,
     default_dtypes: Optional[dict[str, str]] = None,
-    iter_holder: Optional[type] = None,
     with_marker: Optional[type] = None,
 ) -> None:
     """Scan the module's ``@py_class`` IR classes and auto-inject
@@ -892,8 +828,9 @@ def finalize_module(
         ``"tir"`` from ``"tvm_ffi.testing.mini.tir"``).
     iter_kinds
         Iter-kind strings (e.g. ``["serial", "parallel", …]``) to
-        register as ``module.<kind>(lb, ub, step)`` factories. Requires
-        ``iter_holder``.
+        register as ``module.<kind>(lb, ub, step)`` factories. Each
+        returns a typed :class:`~tvm_ffi.pyast.ForFrame` that
+        :meth:`IRParser.visit_for` dispatches on directly.
     dtypes
         Dtype names (e.g. ``["int32", "float32"]``). Auto-registered as
         plain attribute instances on the module via the user-supplied
@@ -903,9 +840,6 @@ def finalize_module(
         Maps literal category → dtype name. Produces
         ``__ffi_default_{int,float,bool}_ty__`` attrs pointing at the
         corresponding ``module.<dtype>`` entries.
-    iter_holder
-        Dataclass used as the runtime value for ``T.serial(...)`` etc.
-        ``finalize_module`` auto-injects ``__ffi_for_handler__`` on it.
     with_marker
         Optional class used as the runtime value for a custom
         ``with``-construct — ``__ffi_with_handler__`` will be injected.
@@ -974,7 +908,6 @@ def finalize_module(
     # Per-class wiring context — accumulates state across rules.
     ctx: dict[str, Any] = {
         "op_classes_map": {},
-        "iter_holder": iter_holder,
         "iter_kinds": iter_kinds or [],
         "with_marker": with_marker,
         "prefix": prefix,
