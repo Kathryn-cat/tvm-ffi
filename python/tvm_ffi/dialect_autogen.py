@@ -999,8 +999,12 @@ def finalize_module(
     # ``hasattr`` guard would lock in the partial router early).
     _ensure_assign_router(module, ctx)
 
-    # Dtype handles — plain PrimTy instances unless a user-provided
-    # dtype-handle class is present on the module.
+    # Dtype handles — synthesize a callable PrimTy subclass so each
+    # ``T.<dtype>`` acts both as a type annotation (base PrimTy) and as
+    # a dual-mode factory (``T.int32(42)`` → Imm, ``T.int32()`` /
+    # ``T.int32(var_name="x")`` → Var). A user-supplied
+    # ``module._DtypeHandle`` still wins (escape hatch). See
+    # ``design_docs/parser_dtype_handle_refactor.md``.
     if dtypes:
         handle_cls = getattr(module, "_DtypeHandle", None)
         prim_ty_cls = _find_class_with_trait(module, tr.PrimTyTraits)
@@ -1010,11 +1014,16 @@ def finalize_module(
                 "``_DtypeHandle`` class (for callable-dtype dialects) "
                 "OR a PrimTy-trait IR class on the module.",
             )
-        ctor = handle_cls if handle_cls is not None else prim_ty_cls
-        field_name = _infer_primty_field_name(ctor)
+        if handle_cls is None:
+            assert prim_ty_cls is not None  # covered by the guard above
+            handle_cls = _make_dtype_handle_class(
+                module, prim_ty_cls, _infer_primty_field_name(prim_ty_cls),
+            )
+            module._DtypeHandle = handle_cls  # type: ignore[attr-defined]
+        field_name = _infer_primty_field_name(handle_cls)
         for dt in dtypes:
             if not hasattr(module, dt):
-                setattr(module, dt, ctor(**{field_name: dt}))
+                setattr(module, dt, handle_cls(**{field_name: dt}))
 
     # Default literal-ty hooks.
     if default_dtypes:
@@ -1108,6 +1117,12 @@ def finalize_module(
 
         module.__getattr__ = _module_getattr  # type: ignore[attr-defined]
 
+    # Auto-regenerate the sibling ``.pyi`` stub when the source ``.py``
+    # is newer (or the stub is missing). Runs last so every other
+    # finalize step has already populated the module. Silently no-ops
+    # in read-only installs; see :func:`_maybe_autowrite_stub`.
+    _maybe_autowrite_stub(module)
+
 
 # Parser-protocol hook names — names the :class:`IRParser` looks up via
 # ``_lookup_hook`` on active dialects. Must NOT be served by the
@@ -1117,6 +1132,72 @@ _PARSER_HOOK_NAMES: frozenset[str] = frozenset([
     "load", "bind", "buffer_store", "if_stmt", "while_stmt", "assert_stmt",
     "for_stmt", "with_stmt", "ret",
 ])
+
+
+# ============================================================================
+# Auto-regen of sibling ``.pyi`` stubs
+# ============================================================================
+
+
+#: Environment variable controlling the ``.pyi`` auto-regeneration
+#: policy at ``finalize_module`` time. Values:
+#:
+#: - ``"auto"`` (default) — write the stub iff it's missing or older
+#:   than the dialect's ``.py`` source.
+#: - ``"always"`` — write unconditionally, ignoring mtimes.
+#: - ``"off"`` / ``"0"`` / ``""`` — never write.
+_STUBGEN_ENV_VAR: str = "TVM_FFI_DIALECT_STUBS"
+_STUBGEN_ENV_OFF: frozenset[str] = frozenset({"off", "0", ""})
+
+
+def _maybe_autowrite_stub(module: "ModuleType") -> None:
+    """Regenerate ``<module>.pyi`` next to the dialect source when stale.
+
+    Auto-regen is opt-on-by-default (``TVM_FFI_DIALECT_STUBS=auto``)
+    with an mtime guard so the fast path on repeat imports is a
+    single ``stat`` call. Any filesystem error (read-only install,
+    cross-fs permission, locked file under CI) is swallowed with a
+    :mod:`warnings` emission so a failing regen can't block parse /
+    print behavior.
+    """
+    import os  # noqa: PLC0415
+
+    policy = os.environ.get(_STUBGEN_ENV_VAR, "auto").lower()
+    if policy in _STUBGEN_ENV_OFF:
+        return
+
+    source_file = getattr(module, "__file__", None)
+    if source_file is None:
+        return
+
+    from pathlib import Path  # noqa: PLC0415
+
+    source_path = Path(source_file)
+    if source_path.suffix != ".py":
+        return  # packages' ``__init__.py`` regen still works;  .pyc / .so do not
+    stub_path = source_path.with_suffix(".pyi")
+
+    if policy != "always" and stub_path.exists():
+        try:
+            if stub_path.stat().st_mtime >= source_path.stat().st_mtime:
+                return  # fresh enough
+        except OSError:
+            return
+
+    try:
+        from tvm_ffi.stub.dialect_stub import write_dialect_stub  # noqa: PLC0415
+
+        write_dialect_stub(module, stub_path)
+    except Exception as exc:  # noqa: BLE001
+        import warnings  # noqa: PLC0415
+
+        warnings.warn(
+            f"tvm-ffi auto-stubgen for {module.__name__!r} failed: "
+            f"{type(exc).__name__}: {exc}. Set "
+            f"``{_STUBGEN_ENV_VAR}=off`` to silence, or run "
+            "``tvm-ffi-stubgen dialects <module>`` manually.",
+            stacklevel=2,
+        )
 
 
 def _find_class_with_trait(module: "ModuleType", trait_cls: type) -> Optional[type]:
@@ -1148,3 +1229,60 @@ def _infer_primty_field_name(cls: type) -> str:
         if field is not None:
             return field
     return "name"
+
+
+def _make_dtype_handle_class(
+    module: "ModuleType", prim_ty_cls: type, dtype_field: str,
+) -> type:
+    """Synthesize a callable :class:`PrimTy` subclass for ``module``.
+
+    The returned class is a regular Python subclass of ``prim_ty_cls``
+    (it's *not* ``@py_class``-registered — it shares the base's FFI
+    type; the parser normalizes subclass instances back to the base
+    via :func:`~tvm_ffi.parse_dispatch._normalize_primty_subclass`).
+    Its ``__call__`` implements the three-way dispatch documented in
+    ``design_docs/parser_dtype_handle_refactor.md`` §3.1:
+
+    ===========================  =======================================
+    Call shape                   Returns
+    ===========================  =======================================
+    ``handle()``                 ``__ffi_make_var__(parser=None, "_", ty)``
+    ``handle(var_name="x")``     ``__ffi_make_var__(parser=None, "x", ty)``
+    ``handle(value)``            :func:`make_imm_for_dtype` on the module
+    ===========================  =======================================
+
+    Passing both ``value`` and ``var_name`` is a :class:`TypeError` —
+    the ambiguity mirrors the pre-refactor mini-TIR behavior.
+    """
+    from tvm_ffi.pyast_trait_parse import make_imm_for_dtype  # noqa: PLC0415
+
+    def __call__(
+        self: Any, value: Any = None, *, var_name: Optional[str] = None,
+    ) -> Any:
+        if value is not None and var_name is not None:
+            raise TypeError(
+                f"{type(self).__name__}(...): cannot pass both ``value`` "
+                "and ``var_name``. Use ``value=`` for an Imm literal, or "
+                "``var_name=`` to declare a fresh Var.",
+            )
+        if value is not None:
+            return make_imm_for_dtype(module, str(getattr(self, dtype_field)), value)
+        # Zero-arg / var_name-only: build a Var with the inherited type.
+        make_var = getattr(module, "__ffi_make_var__", None)
+        if make_var is None:
+            raise RuntimeError(
+                f"{module.__name__}: no ``__ffi_make_var__`` registered; "
+                f"cannot build a Var from a dtype handle call.",
+            )
+        return make_var(None, var_name if var_name is not None else "_", self)
+
+    cls_name = "_DtypeHandle"
+    return type(cls_name, (prim_ty_cls,), {
+        "__call__": __call__,
+        "__module__": module.__name__,
+        "__doc__": (
+            f"Auto-generated callable ``{prim_ty_cls.__name__}`` handle "
+            f"for {module.__name__}. See "
+            "``design_docs/parser_dtype_handle_refactor.md``."
+        ),
+    })

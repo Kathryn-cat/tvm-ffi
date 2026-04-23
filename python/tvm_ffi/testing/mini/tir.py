@@ -538,51 +538,12 @@ class _BlockMarker:
 
 
 # ============================================================================
-# Bucket C — ``_DtypeHandle`` dual-mode callable
-#
-# Mini-TIR's ergonomic ``T.int32()`` (builds a Var) and ``T.int32(42)``
-# (builds an IntImm) pattern requires types to be callable. :class:`PrimTy`
-# alone isn't — we subclass it with ``__call__`` dispatch.
-#
-# This is mini-TIR *policy*, not auto-derivable; ``finalize_module``
-# sees ``_DtypeHandle`` and uses it as the dtype-handle constructor for
-# every name in ``dtypes=[...]``.
+# Callable dtype handles (``T.int32(42)`` / ``T.int32()`` / ...) are
+# synthesized by :func:`tvm_ffi.dialect_autogen._make_dtype_handle_class`
+# once ``finalize_module`` sees ``dtypes=[...]`` + a PrimTy trait class.
+# See ``design_docs/parser_dtype_handle_refactor.md``; no user code is
+# needed anymore.
 # ============================================================================
-
-
-def _parse_type(
-    primty: PrimTy,
-    value: Any = None,
-    var_name: Optional[str] = None,
-) -> Any:
-    """Dispatcher for ``T.<dtype>(...)`` calls bound via :class:`_DtypeHandle`."""
-    if value is not None and var_name is not None:
-        raise TypeError(
-            f"T.{primty.dtype}(...): cannot pass both ``value`` and "
-            f"``var_name``. Use ``value=`` for literal construction "
-            f"(IntImm/FloatImm) or ``var_name=`` for Var construction.",
-        )
-    if value is not None:
-        dt_str = str(primty.dtype)
-        if dt_str in ("float16", "float32", "float64"):
-            return FloatImm(value=float(value), dtype=ffi_dtype(dt_str))
-        return IntImm(value=int(value), dtype=ffi_dtype(dt_str))
-    name = var_name if var_name is not None else "_"
-    return Var(name=name, ty=PrimTy(dtype=primty.dtype))
-
-
-@py_class("mini.tir._DtypeHandle", structural_eq="dag")
-class _DtypeHandle(PrimTy):
-    """Callable :class:`PrimTy` subclass. ``T.int32`` / ``T.float32`` / …
-    are ``_DtypeHandle`` instances — callable in two modes:
-
-    * ``T.int32()`` or ``T.int32(var_name="x")`` → :class:`Var`
-    * ``T.int32(42)`` → :class:`IntImm` (``IntImm``/``FloatImm`` based
-      on the stored dtype)
-    """
-
-    def __call__(self, value: Any = None, *, var_name: Optional[str] = None) -> Any:
-        return _parse_type(self, value=value, var_name=var_name)
 
 
 # ============================================================================

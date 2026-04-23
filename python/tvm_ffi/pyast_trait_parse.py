@@ -352,6 +352,80 @@ def parse_assign(
     return ir_class(**fields)
 
 
+#: Dtype-name substrings that mark a dtype as floating-point. Matches
+#: both the TIR convention (``"float16"`` / ``"float32"`` / ``"float64"``)
+#: and the MLIR convention (``"f16"`` / ``"f32"`` / ``"f64"``). Extend
+#: here if a future dialect introduces a new float-ish prefix.
+_FLOAT_DTYPE_PREFIXES: tuple[str, ...] = ("float", "f")
+
+
+def _dtype_is_float(dtype_str: str) -> bool:
+    """``True`` when ``dtype_str`` names a floating-point scalar."""
+    if dtype_str.startswith("float"):
+        return True
+    # Short MLIR-style names (``f16`` / ``f32`` / ``f64``).
+    return dtype_str in {"f16", "f32", "f64"}
+
+
+def _discover_literal_classes(module: "Any") -> dict[str, type]:
+    """Scan ``module`` for ``@py_class`` IR classes with
+    :class:`LiteralTraits`, returning a ``{format: cls}`` map.
+
+    The dialect-autogen refactor uses this so the synthesized
+    ``_DtypeHandle`` can reach the right ``IntImm`` / ``FloatImm`` class
+    without the user passing one explicitly. Walks ``module.__dict__``
+    because that dict is what :func:`finalize_module` already operates
+    on.
+    """
+    import inspect  # noqa: PLC0415
+
+    out: dict[str, type] = {}
+    for _, cls in inspect.getmembers(module):
+        if not (isinstance(cls, type) and hasattr(cls, "__ffi_ir_traits__")):
+            continue
+        trait = cls.__ffi_ir_traits__
+        if isinstance(trait, tr.LiteralTraits):
+            out.setdefault(trait.format, cls)
+    return out
+
+
+def make_imm_for_dtype(module: "Any", dtype_str: str, value: Any) -> Any:
+    """Build an ``Imm`` IR whose dtype matches ``dtype_str``.
+
+    Lifted out of :func:`parse_literal` so the synthesized
+    ``_DtypeHandle`` (see :func:`tvm_ffi.dialect_autogen._make_dtype_handle_class`)
+    can share a single implementation. Discovers the dialect's
+    ``IntImm`` / ``FloatImm`` classes by scanning ``module`` for
+    :class:`LiteralTraits` with ``format="int"`` / ``"float"``; bool
+    literals are routed through the ``int`` class (every dialect in
+    this tree represents ``bool`` as an ``IntImm`` with ``dtype=bool``).
+
+    Raises :class:`NotImplementedError` when the needed literal class
+    isn't registered on ``module``.
+    """
+    from tvm_ffi import dtype as ffi_dtype  # noqa: PLC0415
+
+    classes = _discover_literal_classes(module)
+    if _dtype_is_float(dtype_str):
+        float_cls = classes.get("float")
+        if float_cls is None:
+            raise NotImplementedError(
+                f"make_imm_for_dtype: {module.__name__} has no "
+                'LiteralTraits class with format="float"; cannot build '
+                f"a float Imm for dtype {dtype_str!r}.",
+            )
+        return float_cls(value=float(value), dtype=ffi_dtype(dtype_str))
+
+    int_cls = classes.get("int")
+    if int_cls is None:
+        raise NotImplementedError(
+            f"make_imm_for_dtype: {module.__name__} has no "
+            'LiteralTraits class with format="int"; cannot build an '
+            f"int Imm for dtype {dtype_str!r}.",
+        )
+    return int_cls(value=int(value), dtype=ffi_dtype(dtype_str))
+
+
 def parse_literal(
     parser: IRParser,
     node: pyast.Literal,
