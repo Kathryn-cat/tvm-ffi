@@ -646,12 +646,11 @@ finalize_module(
     iter_kinds=["serial", "parallel", "unroll", "vectorized"],
     iter_holder=_IterHolder,
     with_marker=_BlockMarker,
-    dtypes=[
-        "int8", "int16", "int32", "int64",
-        "uint8", "uint16", "uint32", "uint64", "bool",
-        "float16", "float32", "float64",
-    ],
-    default_dtypes={"int": "int32", "float": "float32", "bool": "bool"},
+    # ``dtypes`` / ``default_dtypes`` default to the FFI-standard set —
+    # see ``design_docs/parser_dtype_defaults_refactor.md``. Mini-TIR
+    # uses FFI naming (``int32``, ``float32``, ``bool``, etc.) so no
+    # explicit list is needed; ``T.bfloat16`` / ``T.float8_*`` etc. are
+    # picked up automatically.
 )
 
 
@@ -711,19 +710,24 @@ IRModule = _ir_mod.IRModule
 
 # ``_OP_KIND_TO_IR_CLASS`` — derivable from the auto-wired
 # ``__ffi_op_classes__`` map; exposed for tests that assert on its shape.
+# Post ``parser_dtype_defaults_refactor.md`` §7, the map's values are
+# callables named ``_binop_<Cls>`` / ``_unaryop_<Cls>`` (not dotted
+# strings). Extract the class name from the ``__name__`` suffix.
 def _build_op_kind_to_ir_class() -> dict[int, type]:
     result: dict[int, type] = {}
     for kind_int, ref in _this.__ffi_op_classes__.items():  # type: ignore[attr-defined]
-        _, _, cls_name = ref.partition(".")
-        cls = getattr(_this, cls_name, None)
-        if cls is None:
-            # The op_classes map points at the factory function, not the
-            # IR class directly, but the factory name matches the class
-            # name so look it up globally.
-            for _name, _v in _sys.modules[__name__].__dict__.items():
-                if _name == cls_name and isinstance(_v, type):
-                    cls = _v
+        cls_name: str | None = None
+        if callable(ref):
+            name = getattr(ref, "__name__", "")
+            for prefix in ("_binop_", "_unaryop_"):
+                if name.startswith(prefix):
+                    cls_name = name[len(prefix) :]
                     break
+        elif isinstance(ref, str):
+            cls_name = ref.rpartition(".")[-1]
+        if cls_name is None:
+            continue
+        cls = getattr(_this, cls_name, None)
         if cls is not None and isinstance(cls, type):
             result[kind_int] = cls
     return result

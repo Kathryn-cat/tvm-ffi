@@ -2909,7 +2909,16 @@ class IRParser:
         return value
 
     def visit_operation(self, node: Operation) -> Any:
-        """Dispatch a :class:`Operation` via the lang module's ``__ffi_op_classes__`` map.
+        """Dispatch a :class:`Operation` via the lang module's
+        ``__ffi_op_classes__`` map.
+
+        Each ``{OperationKind: handler}`` entry accepts either a direct
+        callable (auto-wired closures from :func:`_wire_binop` /
+        :func:`_wire_unaryop`) or a dotted-string path (user-defined
+        custom dispatchers — e.g. mini.mlir.arith's type-predicate
+        ``_op_add`` / ``_op_sub``). Callables are invoked directly;
+        strings are resolved via :meth:`eval_expr` against the
+        lang-module registry.
         """
         if node.op == OperationKind.Parens:
             return self.eval_expr(node.operands[0])
@@ -2926,12 +2935,16 @@ class IRParser:
             ref = op_classes.get(node.op)
             if ref is None:
                 continue
-            tried.append(ref)
-            parts = ref.split(".")
-            expr: Expr = Id(name=parts[0])
-            for p in parts[1:]:
-                expr = Attr(obj=expr, name=p)
-            parse_fn = self.eval_expr(expr)
+            if callable(ref):
+                tried.append(getattr(ref, "__name__", repr(ref)))
+                parse_fn: Any = ref
+            else:
+                tried.append(str(ref))
+                parts = str(ref).split(".")
+                expr: Expr = Id(name=parts[0])
+                for p in parts[1:]:
+                    expr = Attr(obj=expr, name=p)
+                parse_fn = self.eval_expr(expr)
             result = parse_fn(self, node)
             if result is not None:
                 return result
@@ -2946,8 +2959,8 @@ class IRParser:
         raise NotImplementedError(
             f"visit_operation: no dialect declares ``__ffi_op_classes__`` "
             f"with an entry for OperationKind kind={node.op}. Register a "
-            f"``{{OperationKind.X: '<dotted lang-module path>', ...}}`` map "
-            f"on at least one language module to enable sugar-form "
+            f"``{{OperationKind.X: <callable or 'dotted.path'>, ...}}`` "
+            f"map on at least one language module to enable sugar-form "
             f"(``a + b``) parsing.",
         )
 

@@ -224,24 +224,49 @@ def test_protocol_ffi_assign_hook_wired_on_tlang():
 
 
 def test_protocol_op_classes_map_wired():
-    """``TLang.__ffi_op_classes__`` is a dict {OperationKind: dotted-path str}."""
+    """``TLang.__ffi_op_classes__`` is a dict {OperationKind → callable}.
+
+    Post ``parser_dtype_defaults_refactor.md`` §7: auto-wired entries
+    are closures (named ``_binop_<Cls>`` / ``_unaryop_<Cls>``) stored
+    directly in the map. Dotted-string entries are still accepted for
+    user-defined custom dispatchers on other dialects.
+    """
     op_classes = getattr(mt.TLang, "__ffi_op_classes__", None)
     assert isinstance(op_classes, dict), "TLang.__ffi_op_classes__ must be a dict"
     for kind, ref in op_classes.items():
-        assert isinstance(kind, int), f"key must be OperationKind int, got {type(kind).__name__}"
-        assert isinstance(ref, str), f"value must be a dotted path str, got {type(ref).__name__}"
-        assert "." in ref, f"value must be a dotted path like 'T.Add', got {ref!r}"
+        assert isinstance(kind, int), (
+            f"key must be OperationKind int, got {type(kind).__name__}"
+        )
+        assert callable(ref), (
+            f"value for kind={kind} must be a callable handler, "
+            f"got {type(ref).__name__}"
+        )
 
 
 def test_protocol_t_factories_auto_registered():
-    """Each ``T.<Name>`` mentioned in ``__ffi_op_classes__`` must be a callable
-    on the lang module (``partial(parse_binop, ir_class=...)`` or unary equivalent).
-    """
-    for ref in mt.TLang.__ffi_op_classes__.values():
-        prefix, _, name = ref.partition(".")
-        assert prefix == "T", f"only T.* paths supported in this dialect, got {ref!r}"
-        factory = getattr(mt.TLang, name, None)
-        assert callable(factory), f"{ref} must be auto-registered from __ffi_op_classes__"
+    """Every ``__ffi_op_classes__`` closure names itself ``_binop_<Cls>``
+    / ``_unaryop_<Cls>`` so ``repr`` stays readable; each is callable
+    with ``(parser, op_node)``."""
+    import inspect  # noqa: PLC0415
+
+    for kind, fn in mt.TLang.__ffi_op_classes__.items():
+        assert callable(fn), f"kind={kind} must be callable"
+        name = getattr(fn, "__name__", "")
+        assert name.startswith(("_binop_", "_unaryop_")), (
+            f"closure for kind={kind} should be named ``_binop_<Cls>`` / "
+            f"``_unaryop_<Cls>``, got {name!r}"
+        )
+        sig = inspect.signature(fn)
+        # Two required positional params — parser + op_node.
+        positionals = [
+            p for p in sig.parameters.values()
+            if p.default is inspect.Parameter.empty
+            and p.kind
+            in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        ]
+        assert len(positionals) >= 2, (
+            f"{name} should accept (parser, op_node); got signature {sig}"
+        )
 
 
 def test_protocol_op_classes_unique_op_symbols():

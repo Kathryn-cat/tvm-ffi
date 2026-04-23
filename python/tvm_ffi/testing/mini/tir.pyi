@@ -204,10 +204,17 @@ __ffi_default_float_ty__: _DtypeHandle
 __ffi_default_int_ty__: _DtypeHandle
 __ffi_op_classes__: dict[Any, Any]
 __ffi_parsers__: dict[Any, Any]
+bfloat16: _DtypeHandle
 bool: _DtypeHandle
 float16: _DtypeHandle
 float32: _DtypeHandle
+float4_e2m1fnx2: _DtypeHandle
 float64: _DtypeHandle
+float8_e4m3fn: _DtypeHandle
+float8_e4m3fnuz: _DtypeHandle
+float8_e5m2: _DtypeHandle
+float8_e5m2fnuz: _DtypeHandle
+float8_e8m0fnu: _DtypeHandle
 int16: _DtypeHandle
 int32: _DtypeHandle
 int64: _DtypeHandle

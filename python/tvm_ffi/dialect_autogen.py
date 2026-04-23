@@ -178,66 +178,42 @@ _UNARYOP_SYMBOL_TO_KIND: dict[str, int] = {
 
 @_wiring_rule(tr.BinOpTraits)
 def _wire_binop(module: "ModuleType", cls: type, trait: Any, ctx: dict) -> None:
-    """Attach sugar-path factory to the IR class + register
-    ``__ffi_op_classes__`` entry.
+    """Record a sugar-path :func:`parse_binop` closure for ``cls``
+    directly in ``ctx["op_classes_map"]``.
 
-    The factory is set as a class attribute ``cls._ffi_parse_op``
-    (name chosen to avoid collisions with user class attrs). The
-    ``__ffi_op_classes__`` entry points ``OperationKind.X`` →
-    ``"<prefix>.<Cls>._ffi_parse_op"``; ``visit_operation`` resolves
-    the dotted path at parse time.
-
-    The IR class stays at ``module.<Cls>`` (unchanged from
-    ``@py_class`` registration), so ``isinstance(x, mt.Add)`` + keyword
-    construction ``mt.Add(lhs=a, rhs=b)`` both work. De-sugared call
-    form ``T.Add(a, b)`` at parse time invokes the class constructor
-    positionally (py_class supports this), matching the orig
-    construction contract.
+    Post ``parser_dtype_defaults_refactor.md`` §7: no per-class
+    ``_ffi_parse_op`` static method is installed — the closure goes
+    straight into the dict, and :meth:`IRParser.visit_operation` calls
+    it with ``(parser, op_node)``. The IR class stays pure data; the
+    de-sugared call form ``T.Add(a, b)`` still invokes the class
+    constructor positionally (independent of this map).
     """
     from tvm_ffi.pyast_trait_parse import parse_binop  # noqa: PLC0415
 
-    func_name = trait.text_printer_func_name
+    def _binop(parser: Any, op_node: Any, _cls: type = cls) -> Any:
+        return parse_binop(parser, op_node, ir_class=_cls)
 
-    def _make_sugar_factory(_cls: type = cls) -> Callable:
-        def factory(parser: Any, op_node: Any) -> Any:
-            return parse_binop(parser, op_node, ir_class=_cls)
-
-        factory.__name__ = f"_ffi_parse_op_{_cls.__name__}"
-        return factory
-
-    if not hasattr(cls, "_ffi_parse_op"):
-        cls._ffi_parse_op = staticmethod(_make_sugar_factory())
+    _binop.__name__ = f"_binop_{cls.__name__}"
 
     op_kind = _BINOP_SYMBOL_TO_KIND.get(trait.op)
     if op_kind is not None:
-        prefix = ctx.get("prefix", "T")
-        ctx["op_classes_map"].setdefault(
-            op_kind, f"{prefix}.{cls.__name__}._ffi_parse_op",
-        )
+        ctx["op_classes_map"].setdefault(op_kind, _binop)
 
 
 @_wiring_rule(tr.UnaryOpTraits)
 def _wire_unaryop(module: "ModuleType", cls: type, trait: Any, ctx: dict) -> None:
-    """Unary-op analog of :func:`_wire_binop` — sugar factory on
-    ``cls._ffi_parse_op``, op-classes entry points there."""
+    """Unary-op analog of :func:`_wire_binop` — closure directly in
+    ``ctx["op_classes_map"]``; no ``cls._ffi_parse_op`` mutation."""
     from tvm_ffi.pyast_trait_parse import parse_unaryop  # noqa: PLC0415
 
-    def _make_sugar_factory(_cls: type = cls) -> Callable:
-        def factory(parser: Any, op_node: Any) -> Any:
-            return parse_unaryop(parser, op_node, ir_class=_cls)
+    def _unaryop(parser: Any, op_node: Any, _cls: type = cls) -> Any:
+        return parse_unaryop(parser, op_node, ir_class=_cls)
 
-        factory.__name__ = f"_ffi_parse_op_{_cls.__name__}"
-        return factory
-
-    if not hasattr(cls, "_ffi_parse_op"):
-        cls._ffi_parse_op = staticmethod(_make_sugar_factory())
+    _unaryop.__name__ = f"_unaryop_{cls.__name__}"
 
     op_kind = _UNARYOP_SYMBOL_TO_KIND.get(trait.op)
     if op_kind is not None:
-        prefix = ctx.get("prefix", "T")
-        ctx["op_classes_map"].setdefault(
-            op_kind, f"{prefix}.{cls.__name__}._ffi_parse_op",
-        )
+        ctx["op_classes_map"].setdefault(op_kind, _unaryop)
 
 
 @_wiring_rule(tr.LoadTraits)
@@ -876,6 +852,18 @@ def _resolve_parse_hook(
 # ============================================================================
 
 
+#: Standard ``{literal category → dtype-name}`` defaults consumed when
+#: ``finalize_module(default_dtypes=None)``. Match the naming a dialect
+#: using FFI dtype literals would pick. Pass an explicit
+#: ``default_dtypes={...}`` (custom names) or ``default_dtypes={}`` (no
+#: defaults — bare literals will raise at parse time) to opt out.
+_STANDARD_DEFAULT_DTYPES: dict[str, str] = {
+    "int": "int32",
+    "float": "float32",
+    "bool": "bool",
+}
+
+
 def finalize_module(
     module_name: str,
     *,
@@ -927,6 +915,33 @@ def finalize_module(
     module = sys.modules[module_name]
     if prefix is None:
         prefix = module_name.rsplit(".", 1)[-1]
+
+    # Default ``dtypes`` / ``default_dtypes`` — see
+    # ``design_docs/parser_dtype_defaults_refactor.md``. The defaults
+    # kick in only when the module has a :class:`PrimTyTraits` IR class
+    # AND hasn't already wired its own ``__ffi_default_*_ty__``
+    # (dialects with custom vocabulary like mini.mlir.arith set those
+    # manually before calling ``finalize_module``). Pass
+    # ``dtypes=[]`` / ``default_dtypes={}`` to force "no dtype handles"
+    # on a module that does have a PrimTy.
+    has_prim_ty_trait = _find_class_with_trait(module, tr.PrimTyTraits) is not None
+    has_manual_dtype_defaults = any(
+        hasattr(module, f"__ffi_default_{cat}_ty__")
+        for cat in ("int", "float", "bool")
+    )
+    auto_dtypes_ok = has_prim_ty_trait and not has_manual_dtype_defaults
+
+    if dtypes is None:
+        if auto_dtypes_ok:
+            from tvm_ffi._dtype import STANDARD_DTYPE_NAMES  # noqa: PLC0415
+
+            dtypes = list(STANDARD_DTYPE_NAMES)
+        else:
+            dtypes = []
+    if default_dtypes is None:
+        default_dtypes = (
+            dict(_STANDARD_DEFAULT_DTYPES) if auto_dtypes_ok else {}
+        )
 
     # Discover ALL ``@py_class`` IR classes in the module (or its
     # subpackages). ``__tvm_ffi_type_info__`` is the attribute py_class
