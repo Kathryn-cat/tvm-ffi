@@ -40,10 +40,18 @@ from .utils import FuncInfo, ImportItem, InitConfig, Options
 def __main__() -> int:
     """Command line entry point for ``tvm-ffi-stubgen``.
 
-    This generates in-place type stubs inside special ``tvm-ffi-stubgen`` blocks
-    in the given files or directories. See the module docstring for an
-    overview and examples of the block syntax.
+    Two modes, dispatched by the first positional argument:
+
+    * ``tvm-ffi-stubgen dialects <module> [<module> ...]`` (or ``--all``) —
+      generates sibling ``.pyi`` files for ``@py_class`` dialect modules
+      that call :func:`~tvm_ffi.dialect_autogen.finalize_module`. See
+      :func:`_run_dialects`.
+    * ``tvm-ffi-stubgen <files>`` — the original inline-stub mode that
+      rewrites ``tvm-ffi-stubgen`` directive blocks in the given ``.py``
+      / ``.pyi`` files.
     """
+    if len(sys.argv) > 1 and sys.argv[1] == "dialects":
+        return _run_dialects(sys.argv[2:])
     opt = _parse_args()
     for imp in opt.imports or []:
         importlib.import_module(imp)
@@ -383,6 +391,104 @@ def _parse_args() -> Options:
         verbose=args.verbose,
         dry_run=args.dry_run,
     )
+
+
+def _run_dialects(argv: list[str]) -> int:
+    """Implementation of the ``tvm-ffi-stubgen dialects`` subcommand.
+
+    Writes a sibling ``<module>.pyi`` (next to the module's ``.py``
+    source) for every dialect module named on the command line, or —
+    with ``--all`` — for every already-imported module that looks
+    finalized (has ``__ffi_parsers__`` / ``__ffi_op_classes__``).
+    """
+    from .dialect_stub import (  # noqa: PLC0415
+        discover_finalized_modules,
+        write_dialect_stub,
+    )
+
+    parser = argparse.ArgumentParser(
+        prog="tvm-ffi-stubgen dialects",
+        description=(
+            "Generate sibling .pyi stubs for @py_class dialect modules "
+            "that call finalize_module. The stubs re-declare auto-wired "
+            "attributes (dtype handles, factory / decorator handlers, "
+            "parser hooks, parse hooks, __ffi_* metadata) so IDEs see "
+            "them."
+        ),
+    )
+    parser.add_argument(
+        "modules",
+        nargs="*",
+        metavar="MODULE",
+        help="Dotted module names to generate stubs for (e.g. "
+             "``tvm_ffi.testing.mini.tir``). Ignored when ``--all`` is set.",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Generate stubs for every already-imported module that was "
+             "finalized by finalize_module. Use ``--imports`` to preload "
+             "candidate modules first.",
+    )
+    parser.add_argument(
+        "--imports",
+        type=str,
+        default="",
+        help="Additional imports to load before discovery / generation, "
+             "separated by ';' (e.g. 'pkgA;pkgB.submodule').",
+    )
+    parser.add_argument(
+        "--out-dir",
+        type=str,
+        default="",
+        help="If set, stubs are written to ``<out_dir>/<dotted/path>.pyi`` "
+             "rather than next to each module's .py.",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print each written path to stdout.",
+    )
+    args = parser.parse_args(argv)
+
+    preload = [item.strip() for item in args.imports.split(";") if item.strip()]
+    for imp in preload:
+        importlib.import_module(imp)
+    for mod_name in args.modules:
+        importlib.import_module(mod_name)
+
+    if args.all:
+        targets = discover_finalized_modules()
+    else:
+        targets = list(args.modules)
+    if not targets:
+        print(
+            f"{C.TERM_RED}No modules to generate stubs for. Pass module "
+            f"names or use ``--all``.{C.TERM_RESET}",
+        )
+        return 1
+
+    out_root = Path(args.out_dir).resolve() if args.out_dir else None
+
+    failures = 0
+    for mod_name in targets:
+        try:
+            module = importlib.import_module(mod_name)
+            target: Path | None = None
+            if out_root is not None:
+                target = out_root / (mod_name.replace(".", "/") + ".pyi")
+            written = write_dialect_stub(module, target)
+        except Exception as exc:  # noqa: BLE001
+            failures += 1
+            print(
+                f'{C.TERM_RED}[Failed] {mod_name}: {exc}{C.TERM_RESET}',
+            )
+            if args.verbose:
+                traceback.print_exc()
+            continue
+        if args.verbose:
+            print(f"{C.TERM_CYAN}[Wrote] {written}{C.TERM_RESET}")
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":
