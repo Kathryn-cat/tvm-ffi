@@ -581,6 +581,9 @@ _FFI_TYPE_ATTR_NAMES: frozenset[str] = frozenset(
         "__ffi_traits_print__",
         # IR semantic traits (non-callable object, registered as TypeAttr)
         "__ffi_ir_traits__",
+        # Trait-driven printer prefix override (e.g. "T" or "I"); the C++
+        # printer falls back to its hardcoded default when unset.
+        "__ffi_print_prefix__",
     }
 )
 
