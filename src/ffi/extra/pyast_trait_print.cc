@@ -72,16 +72,16 @@ inline bool IsString(AnyView v) {
 }
 
 // ---- Helper: resolve the module-prefix for an object's type ----
-// Each @py_class can declare ``__ffi_print_prefix__ = "T"`` on its body; the
-// value lands in a TypeAttrColumn. When unset (or not a string), ``fallback``
-// is used. The column pointer is looked up per call since registration can
-// happen after first-use; the underlying lookup is a cheap hashmap hit.
-inline String GetTypePrefix(int32_t type_index, std::string_view fallback) {
+// Each @py_class / @c_class must declare ``__ffi_print_prefix__`` (set
+// per-class in the class body, OR module-wide via
+// ``tvm_ffi.finalize_module(prefix=...)`` at the bottom of the dialect
+// file).
+inline String GetTypePrefix(AnyView obj) {
   static const TVMFFIByteArray kAttrName = {"__ffi_print_prefix__",
                                             sizeof("__ffi_print_prefix__") - 1};
   const TVMFFITypeAttrColumn* column = TVMFFIGetTypeAttrColumn(&kAttrName);
   if (column != nullptr) {
-    int32_t offset = type_index - column->begin_index;
+    int32_t offset = obj.type_index() - column->begin_index;
     if (offset >= 0 && offset < column->size) {
       const TVMFFIAny& stored = column->data[offset];
       if (stored.type_index != kTVMFFINone) {
@@ -92,7 +92,14 @@ inline String GetTypePrefix(int32_t type_index, std::string_view fallback) {
       }
     }
   }
-  return String(fallback.data(), fallback.size());
+  TVM_FFI_THROW(ValueError)
+      << "Class '" << obj.GetTypeKey()
+      << "' has no ``__ffi_print_prefix__`` registered on its TypeAttrColumn. "
+      << "Set it in the class body (``__ffi_print_prefix__ = \"<prefix>\"``) "
+      << "OR call ``tvm_ffi.finalize_module(prefix=\"<prefix>\")`` at the "
+      << "bottom of the dialect module. Trait-driven printing requires an "
+      << "explicit prefix.";
+  return String();  // unreachable
 }
 
 /*! \brief Check if an object is a list/array container (ffi.List or ffi.Array). */
@@ -530,16 +537,14 @@ NodeAST PrintBinOp(AnyView obj, const tr::BinOpTraits& t, const IRPrinter& print
   // existing BinOps keep rendering as ``T.<name>(...)``.
   std::string_view name_sv;
   if (t->text_printer_func_name.has_value()) {
-    name_sv = {t->text_printer_func_name.value().data(),
-               t->text_printer_func_name.value().size()};
+    name_sv = {t->text_printer_func_name.value().data(), t->text_printer_func_name.value().size()};
     if (name_sv.find('.') != std::string_view::npos) {
       return CallAST(ParseCalleeString(name_sv), {lhs, rhs}, {}, {});
     }
   } else {
     name_sv = op_sv;
   }
-  ExprAST callee = ExprAttr(IdAST(GetTypePrefix(obj.type_index(), "T")),
-                            String(name_sv.data(), name_sv.size()));
+  ExprAST callee = ExprAttr(IdAST(GetTypePrefix(obj)), String(name_sv.data(), name_sv.size()));
   return CallAST(callee, {lhs, rhs}, {}, {});
 }
 
@@ -1291,7 +1296,7 @@ NodeAST PrintLiteral(AnyView obj, const tr::LiteralTraits& t, const IRPrinter& p
         if (dtype.code == kDLInt && dtype.bits == 32 && dtype.lanes == 1) {
           return LiteralAST::Int(int_val, {path->Attr("value")});
         }
-        String prefix = GetTypePrefix(obj.type_index(), "T");
+        String prefix = GetTypePrefix(obj);
         // bool → <prefix>.bool(True/False) (kDLBool=6, bits=8 per DLPack convention)
         if (dtype.code == kDLBool) {
           return CallAST(ExprAttr(IdAST(prefix), "bool"),
@@ -1314,7 +1319,7 @@ NodeAST PrintLiteral(AnyView obj, const tr::LiteralTraits& t, const IRPrinter& p
           return LiteralAST::Float(float_val, {path->Attr("value")});
         }
         std::string ds = DLDataTypeToString(dtype);
-        return CallAST(ExprAttr(IdAST(GetTypePrefix(obj.type_index(), "T")), ds),
+        return CallAST(ExprAttr(IdAST(GetTypePrefix(obj)), ds),
                        {LiteralAST::Float(float_val, {path->Attr("value")})}, {}, {});
       }
     }
@@ -1435,12 +1440,12 @@ NodeAST PrintPrimTy(AnyView obj, const tr::PrimTyTraits& t, const IRPrinter& pri
   if (dtype_val.type_index() == TypeIndex::kTVMFFIDataType) {
     DLDataType dtype = dtype_val.cast<DLDataType>();
     std::string s = (dtype.bits == 0 && dtype.lanes == 0) ? "void" : DLDataTypeToString(dtype);
-    return ExprAttr(IdAST(GetTypePrefix(obj.type_index(), "T")), s);
+    return ExprAttr(IdAST(GetTypePrefix(obj)), s);
   }
   // If it's a string like "int32", render as <prefix>.<dtype> (attribute access, not a call)
   if (IsString(dtype_val)) {
     std::string ds(dtype_val.cast<String>().data(), dtype_val.cast<String>().size());
-    return ExprAttr(IdAST(GetTypePrefix(obj.type_index(), "T")), ds);
+    return ExprAttr(IdAST(GetTypePrefix(obj)), ds);
   }
   // Fallback: resolve and print
   return ResolveAndPrint(t->dtype, obj, printer, path->Attr("dtype"));
@@ -1450,8 +1455,7 @@ NodeAST PrintTupleTy(AnyView obj, const tr::TupleTyTraits& t, const IRPrinter& p
                      const AccessPath& path) {
   Any fields_val = ResolveWithPrinter(t->fields, obj, printer);
   List<ExprAST> field_docs = ResolveAsArgList(fields_val, printer, path->Attr("fields"));
-  return CallAST(ExprAttr(IdAST(GetTypePrefix(obj.type_index(), "T")), "Tuple"),
-                 std::move(field_docs), {}, {});
+  return CallAST(ExprAttr(IdAST(GetTypePrefix(obj)), "Tuple"), std::move(field_docs), {}, {});
 }
 
 NodeAST PrintFuncTy(AnyView obj, const tr::FuncTyTraits& t, const IRPrinter& printer,
@@ -1470,8 +1474,10 @@ NodeAST PrintFuncTy(AnyView obj, const tr::FuncTyTraits& t, const IRPrinter& pri
       args.push_back(printer->operator()(std::move(ret_val), path->Attr("ret")).cast<ExprAST>());
     }
   }
-  return CallAST(ExprAttr(IdAST(GetTypePrefix(obj.type_index(), "I")), "FuncType"), std::move(args),
-                 {}, {});
+  // Uniform fallback "T" — matches every other type-trait printer.
+  // Dialects that want "I.FuncType" (IRModule namespace) override per
+  // class via ``cls.__ffi_print_prefix__ = "I"``.
+  return CallAST(ExprAttr(IdAST(GetTypePrefix(obj)), "FuncType"), std::move(args), {}, {});
 }
 
 // ---- BufferTy: T.Buffer(shape, dtype, ...) ----
@@ -1486,7 +1492,7 @@ NodeAST PrintBufferTy(AnyView obj, const tr::BufferTyTraits& t, const IRPrinter&
   // Resolve dtype — elide if None
   Any dtype_val = ResolveWithPrinter(t->dtype, obj, printer);
 
-  ExprAST callee = ExprAttr(IdAST(GetTypePrefix(obj.type_index(), "T")), "Buffer");
+  ExprAST callee = ExprAttr(IdAST(GetTypePrefix(obj)), "Buffer");
   List<ExprAST> args;
   if (shape_raw != nullptr) {
     args.push_back(printer->operator()(std::move(shape_raw), path->Attr("shape")).cast<ExprAST>());
@@ -1593,8 +1599,7 @@ NodeAST PrintTensorTy(AnyView obj, const tr::TensorTyTraits& t, const IRPrinter&
           printer->operator()(std::move(device_val), path->Attr("device")).cast<ExprAST>());
     }
   }
-  return CallAST(ExprAttr(IdAST(GetTypePrefix(obj.type_index(), "T")), "Tensor"), std::move(args),
-                 kw_keys, kw_vals);
+  return CallAST(ExprAttr(IdAST(GetTypePrefix(obj)), "Tensor"), std::move(args), kw_keys, kw_vals);
 }
 
 // ---- ShapeTy: T.Shape(dims?, ndim?) ----
@@ -1617,8 +1622,7 @@ NodeAST PrintShapeTy(AnyView obj, const tr::ShapeTyTraits& t, const IRPrinter& p
           printer->operator()(std::move(ndim_val), path->Attr("ndim")).cast<ExprAST>());
     }
   }
-  return CallAST(ExprAttr(IdAST(GetTypePrefix(obj.type_index(), "T")), "Shape"), std::move(args),
-                 kw_keys, kw_vals);
+  return CallAST(ExprAttr(IdAST(GetTypePrefix(obj)), "Shape"), std::move(args), kw_keys, kw_vals);
 }
 
 }  // namespace
