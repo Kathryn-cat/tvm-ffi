@@ -65,6 +65,7 @@ from ._parse_decorators import (
     get_slot_field,
 )
 from .core import _lookup_type_attr
+from .dataclasses.py_class import _register_print_prefix
 from .pyast import OperationKind
 
 # ---------------------------------------------------------------------------
@@ -823,6 +824,7 @@ def _override_conflict(
 
 def finalize_module(
     module_name: str,
+    prefix: str,
     *,
     default_dtypes: dict[type, Any] | None = None,
     extra_dtypes: tuple[str, ...] | frozenset[str] | None = None,
@@ -835,15 +837,22 @@ def finalize_module(
     decorated IR types, classifies each into a :class:`Tier`, and installs
     placeholder dispatch handlers on the module. Honours
     ``@parse_hook``-decorated module-level functions as explicit
-    overrides. After registration, the dtype handle surface
-    (``T.int32``, …) is installed and an optional sibling ``.pyi`` stub
-    is regenerated.
+    overrides. Each FFI class also gets the dialect's printer prefix
+    registered as ``__ffi_print_prefix__`` (so the C++ printer renders
+    ``T.prim_func``, ``R.func`` etc. without a hard-coded prefix). After
+    registration, the dtype handle surface (``T.int32``, …) is installed
+    and an optional sibling ``.pyi`` stub is regenerated.
 
     Parameters
     ----------
     module_name
         Fully-qualified module name (``__name__`` from the dialect
         file's last line).
+    prefix
+        The dialect's printer prefix (e.g. ``"T"`` for tir, ``"R"`` for
+        relax). Registered onto every FFI-decorated class in this
+        module via ``__ffi_print_prefix__``; classes that already
+        declare the attribute in their body are left alone.
     default_dtypes
         Mapping from Python builtin type (``int``, ``float``, ``bool``)
         to the dtype name that should accept un-annotated values of
@@ -890,27 +899,36 @@ def finalize_module(
 
     registry = _Registry()
 
-    # -- 1. user @parse_hook overrides at module scope come first --
+    # -- 1. printer prefix on every FFI-decorated class --
+    # Walk the same set the rest of finalize_module operates on, but
+    # filter additionally on ``__ffi_print_prefix__`` already present in
+    # ``cls.__dict__`` so an explicit per-class override stays intact.
+    for cls in _iter_dataclasses(module):
+        if "__ffi_print_prefix__" in cls.__dict__:
+            continue
+        _register_print_prefix(cls, prefix)
+
+    # -- 2. user @parse_hook overrides at module scope come first --
     user_overrides = _collect_module_hooks(module)
     for entry in user_overrides:
         registry.add(entry, override=True)
 
-    # -- 2. classify every IR class in the module --
+    # -- 3. classify every IR class in the module --
     for cls in _iter_dataclasses(module):
         # The registry silently honours any user overrides already
         # added; classifier entries that collide raise.
         for entry in _classify(cls):
             registry.add(entry)
 
-    # -- 3. install bindings on the module --
+    # -- 4. install bindings on the module --
     _install_bindings(module, registry)
 
-    # -- 4. dtype handles + default-range alias --
+    # -- 5. dtype handles + default-range alias --
     _install_dtype_handles(module, extra_dtypes or ())
     _install_iter_aliases(module, iter_aliases or {})
     _install_default_dtypes(module, default_dtypes)
 
-    # -- 5. parse-slot inverses on tier-2 classes --
+    # -- 6. parse-slot inverses on tier-2 classes --
     _attach_parse_slots(module)
 
     # -- 6. optional .pyi regeneration --
@@ -932,12 +950,18 @@ def _iter_dataclasses(module: Any) -> list[type]:
 
     Foreign re-exports (classes whose ``__module__`` is different from
     the target) are skipped — only types declared in this dialect.
+    The own-``__dict__`` check on ``__tvm_ffi_type_info__`` excludes
+    undecorated subclasses that merely inherit the marker from an FFI
+    base — registering attrs on those would clobber the parent's
+    TypeAttrColumn entry.
     """
     out: list[type] = []
     target = module.__name__
     seen: set[int] = set()
     for value in module.__dict__.values():
         if not isinstance(value, type):
+            continue
+        if "__tvm_ffi_type_info__" not in value.__dict__:
             continue
         if not getattr(value, "__tvm_ffi_is_dataclass__", False):
             continue

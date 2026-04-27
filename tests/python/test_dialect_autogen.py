@@ -69,7 +69,7 @@ def dialect() -> ModuleType:
     :func:`test_finalize_module_idempotent` — and inspect the module
     attributes read-only.
     """
-    finalize_module(fixtures_module.__name__, auto_stub=False)
+    finalize_module(fixtures_module.__name__, "T", auto_stub=False)
     return fixtures_module
 
 
@@ -666,7 +666,7 @@ class TestConflicts:
         sys.modules[mod.__name__] = mod
         try:
             with pytest.raises(RuntimeError, match=r"duplicate registration"):
-                finalize_module(mod.__name__, auto_stub=False)
+                finalize_module(mod.__name__, "T", auto_stub=False)
         finally:
             sys.modules.pop(mod.__name__, None)
 
@@ -697,7 +697,7 @@ class TestConflicts:
 
         sys.modules[mod.__name__] = mod
         try:
-            finalize_module(mod.__name__, auto_stub=False)
+            finalize_module(mod.__name__, "T", auto_stub=False)
             # The user override wins — module attr is exactly that fn.
             assert getattr(mod, "__ffi_parse_make_var__") is _user_override
         finally:
@@ -724,7 +724,7 @@ class TestConflicts:
         sys.modules[mod.__name__] = mod
         try:
             with pytest.raises(RuntimeError, match=r"@parse_hook slot.*claimed by both"):
-                finalize_module(mod.__name__, auto_stub=False)
+                finalize_module(mod.__name__, "T", auto_stub=False)
         finally:
             sys.modules.pop(mod.__name__, None)
 
@@ -747,7 +747,7 @@ class TestConflicts:
         sys.modules[mod.__name__] = mod
         try:
             with pytest.raises(RuntimeError, match=r"@parse_hook slot.*claimed by both"):
-                finalize_module(mod.__name__, auto_stub=False)
+                finalize_module(mod.__name__, "T", auto_stub=False)
         finally:
             sys.modules.pop(mod.__name__, None)
 
@@ -790,7 +790,7 @@ class TestStubGeneration:
 def test_finalize_module_idempotent(dialect: ModuleType) -> None:
     """Running ``finalize_module`` twice doesn't corrupt the dialect."""
     before = set(registered_names(dialect))
-    finalize_module(dialect.__name__, auto_stub=False)
+    finalize_module(dialect.__name__, "T", auto_stub=False)
     after = set(registered_names(dialect))
     assert before == after
 
