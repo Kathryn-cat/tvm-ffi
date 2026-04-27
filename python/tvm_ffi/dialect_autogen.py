@@ -709,6 +709,19 @@ DEFAULT_DTYPE_NAMES: tuple[str, ...] = (
 )
 
 
+#: Default mapping of Python builtin numeric types to dtype names that
+#: ``finalize_module`` installs as ``__ffi_parse_default_dtypes__`` on
+#: every dialect module. User-supplied ``default_dtypes=`` is merged
+#: *on top* of this baseline (per-key override), so passing
+#: ``default_dtypes={int: "int64"}`` keeps the float/bool defaults
+#: rather than dropping them.
+DEFAULT_DTYPES: dict[type, str] = {
+    int: "int32",
+    float: "float32",
+    bool: "bool",
+}
+
+
 # ---------------------------------------------------------------------------
 # Conflict-resolved registry
 # ---------------------------------------------------------------------------
@@ -1098,16 +1111,27 @@ def _install_iter_aliases(module: Any, mapping: dict[str, str]) -> None:
 
 
 def _install_default_dtypes(module: Any, mapping: dict[type, Any] | None) -> None:
-    """Stash ``default_dtypes`` mapping on the module for downstream parsers.
+    """Stash the merged default-dtypes mapping on the module.
 
-    The actual mapping is normalized to ``{"int": "int32", ...}`` and
-    put on ``module.__ffi_parse_default_dtypes__``.
+    Starts from the :data:`DEFAULT_DTYPES` baseline (``int → int32``,
+    ``float → float32``, ``bool → bool``) and overlays the user-supplied
+    ``default_dtypes=`` per-key. Normalizes to ``{"int": "int32", ...}``
+    and writes it onto ``module.__ffi_parse_default_dtypes__`` (only if
+    the user hasn't already set the attribute themselves).
+
+    Per-key merge — so ``default_dtypes={int: "int64"}`` overrides only
+    the ``int`` slot; ``float`` and ``bool`` keep their defaults.
     """
+    merged: dict[type, Any] = dict(DEFAULT_DTYPES)
+    if mapping:
+        merged.update(mapping)
     canonical: dict[str, str] = {}
-    for k, v in (mapping or {int: "int32", float: "float32", bool: "bool"}).items():
-        if isinstance(k, type) and isinstance(v, str):
+    for k, v in merged.items():
+        if not isinstance(k, type):
+            continue
+        if isinstance(v, str):
             canonical[k.__name__] = v
-        elif isinstance(k, type) and isinstance(v, _DtypeHandle):
+        elif isinstance(v, _DtypeHandle):
             canonical[k.__name__] = v.name
     if not hasattr(module, "__ffi_parse_default_dtypes__"):
         setattr(module, "__ffi_parse_default_dtypes__", canonical)
