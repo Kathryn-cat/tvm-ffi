@@ -636,14 +636,11 @@ class TestFinalizeModuleSurface:
     def test_default_dtypes_user_override_merges(self) -> None:
         """User-supplied ``default_dtypes`` overrides per-key on top of
         :data:`DEFAULT_DTYPES` — float/bool keep their defaults when
-        the user only overrides ``int``."""
-        from types import ModuleType
-
-        import sys as _sys
-
+        the user only overrides ``int``.
+        """
         mod = ModuleType("testing.lang_default_dtypes.partial_override")
         mod.__file__ = ""
-        _sys.modules[mod.__name__] = mod
+        sys.modules[mod.__name__] = mod
         try:
             finalize_module(
                 mod.__name__,
@@ -654,7 +651,7 @@ class TestFinalizeModuleSurface:
             canon = mod.__ffi_parse_default_dtypes__
             assert canon == {"int": "int64", "float": "float32", "bool": "bool"}
         finally:
-            _sys.modules.pop(mod.__name__, None)
+            sys.modules.pop(mod.__name__, None)
 
 
 # ---------------------------------------------------------------------------
