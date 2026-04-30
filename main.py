@@ -22,8 +22,19 @@ from numbers import Number
 from typing import Any, Callable
 
 from tvm_ffi import dataclasses as tdc
-from tvm_ffi import pyast, std
+from tvm_ffi import ir_traits, pyast, std
 from tvm_ffi._pyast_parser import MISSING, Parser, Source
+
+_FIELD_PREFIX = "$field:"
+
+
+def _strip_field(ref: str) -> str:
+    if not ref.startswith(_FIELD_PREFIX):
+        raise ValueError(
+            f"FuncFrame: trait field reference {ref!r} does not start with "
+            f"{_FIELD_PREFIX!r}; only direct field references are supported."
+        )
+    return ref[len(_FIELD_PREFIX) :]
 
 
 @tdc.py_class("T.AllocTensor")
@@ -44,25 +55,45 @@ class AllocTensor(std.SingleBinding):
 
 @dc.dataclass
 class FuncFrame:
-    # TODO: mnemonic???
-    symbol: str
-    attrs: dict[str, Any]
-    ret_type: std.Ty
-    args: list[std.Value]
-    body: list[std.Stmt]
+    ir_cls: type
+    decorator_kwargs: dict[str, Any]
 
-    def __init__(self, symbol: str, attrs: dict[str, Any]) -> None:
-        self.symbol = symbol
-        self.attrs = attrs
+    symbol: str = ""
+    args: list[std.Value] = dc.field(default_factory=list)
+    body: list[std.Stmt] = dc.field(default_factory=list)
+    ret_type: Any = None
 
-    def to_dialect(self) -> std.Func:
-        return std.Func(
-            symbol=self.symbol,
-            args=self.args,
-            ret_type=self.ret_type,
-            attrs=std.DictAttrs(self.attrs),
-            body=self.body,
-        )
+    def __init__(self, ir_cls: type, decorator_kwargs: dict[str, Any]) -> None:
+        self.ir_cls = ir_cls
+        self.decorator_kwargs = decorator_kwargs
+        self.symbol = ""
+        self.args = []
+        self.body = []
+        self.ret_type = None
+
+    def to_dialect(self) -> Any:
+        trait = getattr(self.ir_cls, "__ffi_ir_traits__", None)
+        if not isinstance(trait, ir_traits.FuncTraits):
+            raise TypeError(
+                f"FuncFrame.to_dialect: {self.ir_cls.__name__} has no "
+                f"FuncTraits; got {type(trait).__name__!r}."
+            )
+
+        region = trait.region
+        fields: dict[str, Any] = {_strip_field(trait.symbol): self.symbol}
+
+        if trait.attrs is not None:
+            fields[_strip_field(trait.attrs)] = std.DictAttrs(values=self.decorator_kwargs)
+
+        if region.def_values is not None:
+            fields[_strip_field(region.def_values)] = self.args
+
+        fields[_strip_field(region.body)] = self.body
+
+        if region.ret is not None:
+            fields[_strip_field(region.ret)] = self.ret_type
+
+        return self.ir_cls(**fields)
 
 
 class ForFrame:
@@ -120,8 +151,8 @@ class T:
             return func
 
         decorator.__ffi_parse__ = FuncFrame(
-            symbol="",
-            attrs=kwargs,
+            ir_cls=std.Func,
+            decorator_kwargs=kwargs,
         )
         return decorator
 

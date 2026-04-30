@@ -24,6 +24,7 @@ from typing import Any, TypeVar
 
 import tvm_ffi as ffi
 from tvm_ffi import dataclasses as dc
+from tvm_ffi import ir_traits
 
 ############## Basic components ##############
 
@@ -88,6 +89,19 @@ class Value(Expr):
 
 @dc.py_class("ffi.std.Func")
 class Func(Stmt):
+    __ffi_ir_traits__ = ir_traits.FuncTraits(
+        "$field:symbol",
+        ir_traits.RegionTraits(
+            "$field:body",
+            "$field:args",
+            None,
+            "$field:ret_type",
+        ),
+        "$field:attrs",
+        "function",
+        None,
+    )
+
     symbol: str
     attrs: Attrs | None
     args: list[Value] = dc.field(structural_eq="def")
