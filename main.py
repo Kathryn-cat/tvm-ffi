@@ -56,16 +56,15 @@ class AllocTensor(std.SingleBinding):
 @dc.dataclass
 class FuncFrame:
     ir_cls: type
-    decorator_kwargs: dict[str, Any]
-
+    attrs: dict[str, Any]
     symbol: str = ""
     args: list[std.Value] = dc.field(default_factory=list)
     body: list[std.Stmt] = dc.field(default_factory=list)
     ret_type: Any = None
 
-    def __init__(self, ir_cls: type, decorator_kwargs: dict[str, Any]) -> None:
+    def __init__(self, ir_cls: type, attrs: dict[str, Any]) -> None:
         self.ir_cls = ir_cls
-        self.decorator_kwargs = decorator_kwargs
+        self.attrs = attrs
         self.symbol = ""
         self.args = []
         self.body = []
@@ -81,52 +80,81 @@ class FuncFrame:
 
         region = trait.region
         fields: dict[str, Any] = {_strip_field(trait.symbol): self.symbol}
-
         if trait.attrs is not None:
-            fields[_strip_field(trait.attrs)] = std.DictAttrs(values=self.decorator_kwargs)
-
+            fields[_strip_field(trait.attrs)] = std.DictAttrs(values=self.attrs)
         if region.def_values is not None:
             fields[_strip_field(region.def_values)] = self.args
-
         fields[_strip_field(region.body)] = self.body
-
         if region.ret is not None:
             fields[_strip_field(region.ret)] = self.ret_type
-
         return self.ir_cls(**fields)
 
 
+@dc.dataclass
 class ForFrame:
+    ir_cls: type
     range_: std.Range
     value: std.Value
     attrs: std.Attrs
-    body: list[std.Stmt]
+    body: list[std.Stmt] = dc.field(default_factory=list)
+    carry_inits: list[std.Expr] = dc.field(default_factory=list)
 
     def __init__(
         self,
+        ir_cls: type,
         range_: std.Range,
         value: std.Value,
         attrs: std.Attrs,
     ) -> None:
+        self.ir_cls = ir_cls
         self.range_ = range_
         self.value = value
         self.attrs = attrs
+        self.body = []
+        self.carry_inits = []
 
-    def to_dialect(self) -> std.For:
-        return std.For(
-            range_=self.range_,
-            values=[self.value],
-            attrs=std.Attrs(),
-            body=self.body,
-            carry_inits=[],
-        )
+    def to_dialect(self) -> Any:
+        trait = getattr(self.ir_cls, "__ffi_ir_traits__", None)
+        if not isinstance(trait, ir_traits.ForTraits):
+            raise TypeError(
+                f"ForFrame.to_dialect: {self.ir_cls.__name__} has no "
+                f"ForTraits; got {type(trait).__name__!r}."
+            )
+
+        region = trait.region
+        fields: dict[str, Any] = {_strip_field(region.body): self.body}
+        if region.def_values is not None:
+            fields[_strip_field(region.def_values)] = [self.value]
+        if region.def_expr is not None:
+            fields[_strip_field(region.def_expr)] = self.range_
+        if trait.attrs is not None:
+            fields[_strip_field(trait.attrs)] = self.attrs
+        if trait.carry_init is not None:
+            fields[_strip_field(trait.carry_init)] = self.carry_inits
+        return self.ir_cls(**fields)
 
 
 @dc.dataclass
 class IFThenElseFrame:
+    ir_cls: type
     cond: std.Expr
     then_body: list[std.Stmt]
     else_body: list[std.Stmt]
+
+    def to_dialect(self) -> Any:
+        trait = getattr(self.ir_cls, "__ffi_ir_traits__", None)
+        if not isinstance(trait, ir_traits.IfTraits):
+            raise TypeError(
+                f"IFThenElseFrame.to_dialect: {self.ir_cls.__name__} has no "
+                f"IfTraits; got {type(trait).__name__!r}."
+            )
+        fields: dict[str, Any] = {
+            _strip_field(trait.cond): self.cond,
+            _strip_field(trait.then_region.body): self.then_body,
+        }
+        if trait.else_region is not None:
+            fields[_strip_field(trait.else_region.body)] = self.else_body
+        return self.ir_cls(**fields)
 
 
 class T:
@@ -152,7 +180,7 @@ class T:
 
         decorator.__ffi_parse__ = FuncFrame(
             ir_cls=std.Func,
-            decorator_kwargs=kwargs,
+            attrs=kwargs,
         )
         return decorator
 
@@ -175,6 +203,7 @@ class T:
                 step = std.IntImm(std.AnyTy(), step)
 
         return ForFrame(
+            ir_cls=std.For,
             range_=std.Range(start=start, stop=stop, step=step),
             value=std.Value(name="_", ty=std.PrimTy(dtype="int32")),
             attrs=std.Attrs(),
@@ -211,13 +240,23 @@ def _tensor_store(tensor: std.Value, value: std.Expr | Number, *indices: std.Exp
     )
 
 
-_MORE_GENERICS: dict[tuple[str, type[std.Ty]], Callable[..., Any]] = {
+def _if_stmt(cond: std.Expr, then_body: list[std.Stmt], else_body: list[std.Stmt]) -> std.Stmt:
+    return IFThenElseFrame(
+        ir_cls=std.IfStmt,
+        cond=cond,
+        then_body=then_body,
+        else_body=else_body,
+    ).to_dialect()
+
+
+_MORE_GENERICS: dict[tuple[str, type[std.Ty] | str], Callable[..., Any]] = {
     ("__load__", std.TensorTy): _tensor_load,
     ("__store__", std.TensorTy): _tensor_store,
     ("__add__", std.PrimTy): std.Add._make,
     ("__sub__", std.PrimTy): std.Sub._make,
     ("__lt__", std.PrimTy): std.Lt._make,
     ("__mul__", std.PrimTy): std.Mul._make,
+    ("__if_stmt__", "T"): _if_stmt,
 }
 
 

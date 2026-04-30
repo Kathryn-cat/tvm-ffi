@@ -98,7 +98,7 @@ class Func(Stmt):
             "$field:ret_type",
         ),
         "$field:attrs",
-        "function",
+        "std.function",
         None,
     )
 
@@ -360,6 +360,22 @@ class CallExpr(Expr):
 
 @dc.py_class("ffi.std.IfStmt")
 class IfStmt(Stmt):
+    __ffi_ir_traits__ = ir_traits.IfTraits(
+        "$field:cond",
+        ir_traits.RegionTraits(
+            "$field:then_body",
+            None,
+            None,
+            None,
+        ),
+        ir_traits.RegionTraits(
+            "$field:else_body",
+            None,
+            None,
+            None,
+        ),
+    )
+
     cond: Expr
     then_body: list[Stmt]
     else_body: list[Stmt]
@@ -367,6 +383,22 @@ class IfStmt(Stmt):
 
 @dc.py_class("ffi.std.For")
 class For(Stmt):
+    __ffi_ir_traits__ = ir_traits.ForTraits(
+        ir_traits.RegionTraits(
+            "$field:body",
+            "$field:values",
+            "$field:range_",
+            None,
+        ),
+        None,
+        None,
+        None,
+        None,
+        "$field:carry_inits",
+        "$field:attrs",
+        "std.for",
+    )
+
     range_: Range
     attrs: Attrs | None
     carry_inits: list[Expr]
