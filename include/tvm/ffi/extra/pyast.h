@@ -36,9 +36,9 @@
 #include <tvm/ffi/object.h>
 #include <tvm/ffi/optional.h>
 #include <tvm/ffi/reflection/access_path.h>
+#include <tvm/ffi/reflection/accessor.h>
 #include <tvm/ffi/string.h>
 
-#include <algorithm>
 #include <iomanip>
 #include <sstream>
 #include <string>
@@ -2630,6 +2630,14 @@ struct PrinterConfigObj : public Object {
    * underline the first argument.
    */
   List<AccessPath> path_to_underline;
+  /*!
+   * \brief Dialect and mnemonic aliases used when printing IR callees.
+   *
+   * Keys may be a dialect such as ``"std"`` or a full mnemonic such as
+   * ``"std$Add"``.  The value ``"*"`` suppresses the prefix.  Full mnemonic
+   * entries take precedence over dialect entries.
+   */
+  Dict<String, String> dialect_print_map;
   /// \cond Doxygen_Suppress
   PrinterConfigObj() = default;
   /*!
@@ -2640,16 +2648,19 @@ struct PrinterConfigObj : public Object {
    * \param num_context_lines Context lines around underlined regions (-1 = all).
    * \param print_addr_on_dup_var Whether to append hex address for duplicate names.
    * \param path_to_underline Access paths to underline in the output.
+   * \param dialect_print_map Dialect and mnemonic print aliases.
    */
   explicit PrinterConfigObj(bool def_free_var, int32_t indent_spaces, int8_t print_line_numbers,
                             int32_t num_context_lines, bool print_addr_on_dup_var,
-                            List<AccessPath> path_to_underline)
+                            List<AccessPath> path_to_underline,
+                            Dict<String, String> dialect_print_map)
       : def_free_var(def_free_var),
         indent_spaces(indent_spaces),
         print_line_numbers(print_line_numbers),
         num_context_lines(num_context_lines),
         print_addr_on_dup_var(print_addr_on_dup_var),
-        path_to_underline(std::move(path_to_underline)) {}
+        path_to_underline(std::move(path_to_underline)),
+        dialect_print_map(std::move(dialect_print_map)) {}
   /// \endcond
   /// \cond Doxygen_Suppress
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("ffi.pyast.PrinterConfig", PrinterConfigObj, Object);
@@ -2679,14 +2690,16 @@ struct PrinterConfig : public ObjectRef {
    * \param num_context_lines Context lines around underlined regions (default -1 = all).
    * \param print_addr_on_dup_var Whether to append hex address for duplicate names (default false).
    * \param path_to_underline Access paths to underline in the output (default empty).
+   * \param dialect_print_map Dialect and mnemonic print aliases (default empty).
    */
   explicit PrinterConfig(bool def_free_var = true, int32_t indent_spaces = 2,
                          int8_t print_line_numbers = 0, int32_t num_context_lines = -1,
                          bool print_addr_on_dup_var = false,
-                         List<AccessPath> path_to_underline = {})
-      : PrinterConfig(make_object<PrinterConfigObj>(def_free_var, indent_spaces, print_line_numbers,
-                                                    num_context_lines, print_addr_on_dup_var,
-                                                    std::move(path_to_underline))) {}
+                         List<AccessPath> path_to_underline = {},
+                         Dict<String, String> dialect_print_map = {})
+      : PrinterConfig(make_object<PrinterConfigObj>(
+            def_free_var, indent_spaces, print_line_numbers, num_context_lines,
+            print_addr_on_dup_var, std::move(path_to_underline), std::move(dialect_print_map))) {}
   /// \cond Doxygen_Suppress
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(PrinterConfig, ObjectRef, PrinterConfigObj);
   /// \endcond
@@ -3009,6 +3022,19 @@ struct IRPrinterObj : public Object {
    * \endcode
    */
   Optional<ExprAST> VarGet(const ObjectRef& obj);
+
+  /*!
+   * \brief Build a callee expression from an object's registered mnemonic.
+   *
+   * The ``__ffi_mnemonic__`` type attribute must use ``dialect$name`` spelling,
+   * for example ``std$Add``.  A non-empty \p name overrides the default printed
+   * name when a printer uses sugar such as ``func`` or ``i32``.
+   *
+   * Full mnemonic aliases in ``cfg->dialect_print_map`` take precedence over
+   * dialect aliases.  The alias value ``"*"`` drops the prefix and returns just
+   * the printed name.
+   */
+  ExprAST Callee(const ObjectRef& obj, String name = {}) const;
   /*!
    * \brief Convert a source value to a text format AST node using registered
    *        __ffi_text_print__ dispatch.
@@ -3224,6 +3250,38 @@ inline bool IsPythonKeyword(const char* data, size_t len) {
   return kKeywords.count(std::string(data, len)) > 0;
 }
 
+/*! \brief Build an expression from a dotted name such as ``std.MyAdd``. */
+inline ExprAST DottedName(String name) {
+  const char* data = name.data();
+  size_t size = name.size();
+  size_t start = 0;
+  ExprAST result;
+  bool has_segment = false;
+  while (start < size) {
+    size_t end = start;
+    while (end < size && data[end] != '.') {
+      ++end;
+    }
+    if (end == start) {
+      start = end + 1;
+      continue;
+    }
+    String segment(data + start, end - start);
+    if (!has_segment) {
+      result = IdAST(segment);
+      has_segment = true;
+    } else {
+      result = ExprAttr(std::move(result), segment);
+    }
+    if (end == size) break;
+    start = end + 1;
+  }
+  if (!has_segment) {
+    return IdAST(std::move(name));
+  }
+  return result;
+}
+
 /************** Inline: IRPrinterObj methods **************/
 
 inline IdAST IRPrinterObj::VarDef(String name_hint, const ObjectRef& obj,
@@ -3244,9 +3302,13 @@ inline IdAST IRPrinterObj::VarDef(String name_hint, const ObjectRef& obj,
   // Normalize characters that aren't valid in Python identifiers.
   // Non-ASCII bytes (UTF-8) are left as-is since Python allows Unicode identifiers (PEP 3131).
   {
-    bool needs_normalize =
-        std::any_of(name_hint.data(), name_hint.data() + name_hint.size(),
-                    [](char c) { return !IsIdentifierChar(c, /*is_first=*/false); });
+    bool needs_normalize = false;
+    for (size_t i = 0; i < name_hint.size(); ++i) {
+      if (!IsIdentifierChar(name_hint.data()[i], /*is_first=*/false)) {
+        needs_normalize = true;
+        break;
+      }
+    }
     if (needs_normalize) {
       std::string buf(name_hint.data(), name_hint.size());
       for (char& c : buf) {
@@ -3339,6 +3401,46 @@ inline Optional<ExprAST> IRPrinterObj::VarGet(const ObjectRef& obj) {
     return Optional<ExprAST>{};
   }
   return (*it).second->creator().cast<ExprAST>();
+}
+
+inline ExprAST IRPrinterObj::Callee(const ObjectRef& obj, String name) const {
+  static reflection::TypeAttrColumn mnemonic_col(reflection::type_attr::kMnemonic);
+  AnyView mnemonic_view = mnemonic_col[obj->type_index()];
+  if (mnemonic_view == nullptr) {
+    if (name.size() != 0) {
+      return DottedName(std::move(name));
+    }
+    const TVMFFITypeInfo* info = TVMFFIGetTypeInfo(obj->type_index());
+    return IdAST(String(info->type_key.data, info->type_key.size));
+  }
+
+  String mnemonic = mnemonic_view.cast<String>();
+  std::string mnemonic_str(mnemonic.data(), mnemonic.size());
+  size_t sep = mnemonic_str.find('$');
+  if (sep == std::string::npos || sep == 0 || sep + 1 >= mnemonic_str.size()) {
+    if (name.size() != 0) {
+      return DottedName(std::move(name));
+    }
+    return DottedName(std::move(mnemonic));
+  }
+  String dialect(mnemonic_str.data(), sep);
+  String default_name(mnemonic_str.data() + sep + 1, mnemonic_str.size() - sep - 1);
+  String printed_name = name.size() != 0 ? std::move(name) : std::move(default_name);
+  if (this->cfg->dialect_print_map.count(mnemonic)) {
+    String mapped = this->cfg->dialect_print_map[mnemonic];
+    if (mapped == "*") {
+      return IdAST(std::move(printed_name));
+    }
+    return DottedName(std::move(mapped));
+  }
+  if (this->cfg->dialect_print_map.count(dialect)) {
+    String mapped = this->cfg->dialect_print_map[dialect];
+    if (mapped == "*") {
+      return IdAST(std::move(printed_name));
+    }
+    return ExprAttr(DottedName(std::move(mapped)), std::move(printed_name));
+  }
+  return ExprAttr(DottedName(std::move(dialect)), std::move(printed_name));
 }
 
 inline Any IRPrinterObj::operator()(Any source, AccessPath path) const {  // NOLINT(*-value-param)

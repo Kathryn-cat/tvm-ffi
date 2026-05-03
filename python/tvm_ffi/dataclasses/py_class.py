@@ -328,6 +328,15 @@ def _validate_method_name(cls: type, name: str) -> None:
         )
 
 
+def _validate_type_attr_value(cls: type, name: str, value: Any) -> None:
+    """Reject malformed non-callable TypeAttrColumn values."""
+    if name == "__ffi_mnemonic__" and not isinstance(value, str):
+        raise TypeError(
+            f"@py_class({cls.__name__!r}): '__ffi_mnemonic__' must be a str, "
+            f"got {type(value).__name__}.",
+        )
+
+
 def _collect_py_methods(cls: type) -> list[tuple[str, Any, bool]] | None:
     """Extract FFI-registered entries from a ``@py_class`` body.
 
@@ -372,6 +381,8 @@ def _collect_py_methods(cls: type) -> list[tuple[str, Any, bool]] | None:
                 "method. If you wrote ``@classmethod @method``, swap to "
                 "``@staticmethod @method`` (or drop @classmethod).",
             )
+        if name in _FFI_TYPE_ATTR_NAMES:
+            _validate_type_attr_value(cls, name, value)
         is_static = isinstance(value, staticmethod)
         func = value.__func__ if is_static else value
         methods.append((name, func, is_static))
@@ -611,6 +622,8 @@ _FFI_TYPE_ATTR_NAMES: frozenset[str] = frozenset(
         "__data_from_json__",
         # IR printing (text printer dispatch)
         "__ffi_text_print__",
+        # IR dialect metadata
+        "__ffi_mnemonic__",
     }
 )
 

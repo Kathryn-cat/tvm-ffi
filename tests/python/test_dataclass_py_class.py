@@ -384,6 +384,48 @@ class TestClassVar:
 
         assert CVPres.tag == "hello"
 
+    def test_ffi_mnemonic_classvar_registered_as_type_attr(self) -> None:
+        @py_class(_unique_key("CVMnemonic"))
+        class CVMnemonic(Object):
+            __ffi_mnemonic__: ClassVar[str] = "test$CVMnemonic"
+            x: int
+
+        info = _get_type_info(CVMnemonic)
+        field_names = [f.name for f in info.fields]
+
+        assert CVMnemonic.__ffi_mnemonic__ == "test$CVMnemonic"
+        assert "__ffi_mnemonic__" not in field_names
+        assert core._lookup_type_attr(info.type_index, "__ffi_mnemonic__") == "test$CVMnemonic"
+
+    def test_ffi_mnemonic_is_not_registered_as_type_method(self) -> None:
+        @py_class(_unique_key("CVMnemonicNoMethod"))
+        class CVMnemonicNoMethod(Object):
+            __ffi_mnemonic__: ClassVar[str] = "test$CVMnemonicNoMethod"
+            x: int
+
+        info = _get_type_info(CVMnemonicNoMethod)
+
+        assert "__ffi_mnemonic__" not in [method.name for method in info.methods]
+        assert core._lookup_type_attr(info.type_index, "__ffi_mnemonic__") == (
+            "test$CVMnemonicNoMethod"
+        )
+
+    def test_ffi_mnemonic_rejects_non_string_value(self) -> None:
+        with pytest.raises(TypeError, match="'__ffi_mnemonic__' must be a str"):
+
+            @py_class(_unique_key("CVMnemonicBadInt"))
+            class _CVMnemonicBadInt(Object):
+                __ffi_mnemonic__: ClassVar[int] = 1
+                x: int
+
+    def test_ffi_mnemonic_rejects_staticmethod_value(self) -> None:
+        with pytest.raises(TypeError, match="'__ffi_mnemonic__' must be a str"):
+
+            @py_class(_unique_key("CVMnemonicBadStatic"))
+            class _CVMnemonicBadStatic(Object):
+                x: int
+                __ffi_mnemonic__ = staticmethod(lambda: "test$Bad")
+
 
 # ###########################################################################
 #  6. Init generation

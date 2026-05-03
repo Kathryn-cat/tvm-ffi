@@ -343,11 +343,11 @@ inline constexpr const char* kInit = "__ffi_init__";
 /*!
  * \brief Convert ``AnyView`` to a specific reflected ``TSelf`` type.
  *
- * Registered via ``TypeAttrDef<T>.def(kConvert, &FFIConvertFromAnyViewToObjectRef<T>)``
- * for every type that calls ``.ref<T>()``.  Used by the Python type converter
+ * Registered via ``TypeAttrDef<TObj>().def_convert<TSelf>()`` or
+ * ``ObjectDef<TObj>().def_convert<TSelf>()``. Used by the Python type converter
  * to marshal values into the correct ``TSelf`` subclass.
  *
- * Signature: ``(AnyView src) -> TSelf``, where ``TSelf`` is a subclass of ObjectRef.
+ * Signature: ``(AnyView src) -> TSelf``, where ``TSelf`` has a registered TypeTraits converter.
  */
 inline constexpr const char* kConvert = "__ffi_convert__";
 /*!
@@ -371,6 +371,25 @@ inline constexpr const char* kShallowCopy = "__ffi_shallow_copy__";
  * ObjectRef, and ``FnRepr: (AnyView value) -> String`` formats a nested value.
  */
 inline constexpr const char* kRepr = "__ffi_repr__";
+/*!
+ * \brief Custom Python-style text-print hook.
+ *
+ * If registered, ``pyast::IRPrinter`` calls this instead of default field-by-field
+ * printing.  The hook receives the active printer and access path, and returns a
+ * ``pyast::NodeAST`` that is later rendered to text.
+ *
+ * Signature: ``(TSelf self, pyast::IRPrinter printer, AccessPath path) -> pyast::NodeAST``,
+ * where ``TSelf`` is a subclass of ObjectRef.
+ */
+inline constexpr const char* kTextPrint = "__ffi_text_print__";
+/*!
+ * \brief Fully-qualified IR mnemonic for a reflected node type.
+ *
+ * The value is a ``String`` with the form ``{dialect}${name}``, such as
+ * ``std$Add``.  It is metadata for IR printers, parsers, and dialect-aware
+ * tooling, and is not a reflected field.
+ */
+inline constexpr const char* kMnemonic = "__ffi_mnemonic__";
 /*!
  * \brief Custom recursive hash hook.
  *

@@ -331,6 +331,17 @@ class TestMethodValidation:
                 def __ffi_repr__(self, fn_repr: Any) -> str:
                     return "r"
 
+    def test_rejects_ffi_mnemonic_as_method(self) -> None:
+        with pytest.raises(NameError, match=r"TypeAttrColumn"):
+
+            @py_class(_unique_key("RMnemonic"))
+            class _RMnemonic(Object):
+                x: int
+
+                @method
+                def __ffi_mnemonic__(self) -> str:
+                    return "test$Bad"
+
     def test_rejects_python_protocol_dunder(self) -> None:
         """``__len__`` / ``__iter__`` / etc. are reserved for Python
         semantics — cannot be FFI TypeMethods.
