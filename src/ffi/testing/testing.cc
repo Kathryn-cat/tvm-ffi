@@ -29,6 +29,7 @@
 #include <tvm/ffi/dtype.h>
 #include <tvm/ffi/enum.h>
 #include <tvm/ffi/extra/c_env_api.h>
+#include <tvm/ffi/extra/structural_visit.h>
 #include <tvm/ffi/function.h>
 #include <tvm/ffi/optional.h>
 #include <tvm/ffi/reflection/accessor.h>
@@ -37,8 +38,10 @@
 
 #include <chrono>
 #include <iostream>
+#include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
 namespace tvm {
 namespace ffi {
@@ -79,6 +82,214 @@ TVM_FFI_STATIC_INIT_BLOCK() {
       .def("sum", &TestIntPair::Sum, "Method to compute sum of a and b");
   refl::TypeAttrDef<TestIntPairObj>().def(
       refl::type_attr::kConvert, &refl::details::FFIConvertFromAnyViewToObjectRef<TestIntPair>);
+}
+
+class TestStructuralVisitVarObj : public Object {
+ public:
+  String name;
+
+  explicit TestStructuralVisitVarObj(String name) : name(std::move(name)) {}
+
+  static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind = kTVMFFISEqHashKindFreeVar;
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("testing.StructuralVisitVar", TestStructuralVisitVarObj,
+                                    Object);
+};
+
+class TestStructuralVisitVar : public ObjectRef {
+ public:
+  explicit TestStructuralVisitVar(String name) {
+    data_ = make_object<TestStructuralVisitVarObj>(std::move(name));
+  }
+
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(TestStructuralVisitVar, ObjectRef,
+                                                TestStructuralVisitVarObj);
+};
+
+class TestStructuralVisitConstObj : public Object {
+ public:
+  int64_t value;
+
+  explicit TestStructuralVisitConstObj(int64_t value) : value(value) {}
+
+  static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind = kTVMFFISEqHashKindTreeNode;
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("testing.StructuralVisitConst", TestStructuralVisitConstObj,
+                                    Object);
+};
+
+class TestStructuralVisitConst : public ObjectRef {
+ public:
+  explicit TestStructuralVisitConst(int64_t value) {
+    data_ = make_object<TestStructuralVisitConstObj>(value);
+  }
+
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(TestStructuralVisitConst, ObjectRef,
+                                                TestStructuralVisitConstObj);
+};
+
+class TestStructuralVisitAddObj : public Object {
+ public:
+  ObjectRef lhs;
+  ObjectRef rhs;
+
+  TestStructuralVisitAddObj(ObjectRef lhs, ObjectRef rhs)
+      : lhs(std::move(lhs)), rhs(std::move(rhs)) {}
+
+  static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind = kTVMFFISEqHashKindTreeNode;
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("testing.StructuralVisitAdd", TestStructuralVisitAddObj,
+                                    Object);
+};
+
+class TestStructuralVisitAdd : public ObjectRef {
+ public:
+  TestStructuralVisitAdd(ObjectRef lhs, ObjectRef rhs) {
+    data_ = make_object<TestStructuralVisitAddObj>(std::move(lhs), std::move(rhs));
+  }
+
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(TestStructuralVisitAdd, ObjectRef,
+                                                TestStructuralVisitAddObj);
+};
+
+class TestStructuralVisitFuncObj : public Object {
+ public:
+  Array<ObjectRef> params;
+  ObjectRef body;
+
+  TestStructuralVisitFuncObj(Array<ObjectRef> params, ObjectRef body)
+      : params(std::move(params)), body(std::move(body)) {}
+
+  static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind = kTVMFFISEqHashKindTreeNode;
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("testing.StructuralVisitFunc", TestStructuralVisitFuncObj,
+                                    Object);
+};
+
+class TestStructuralVisitFunc : public ObjectRef {
+ public:
+  TestStructuralVisitFunc(Array<ObjectRef> params, ObjectRef body) {
+    data_ = make_object<TestStructuralVisitFuncObj>(std::move(params), std::move(body));
+  }
+
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(TestStructuralVisitFunc, ObjectRef,
+                                                TestStructuralVisitFuncObj);
+};
+
+struct StructuralVisitTraceState {
+  std::vector<std::string> entries;
+
+  static const char* DefRegionKindName(TVMFFIDefRegionKind kind) {
+    switch (kind) {
+      case kTVMFFIDefRegionKindNone:
+        return "none";
+      case kTVMFFIDefRegionKindNonRecursive:
+        return "non_recursive";
+      case kTVMFFIDefRegionKindRecursive:
+        return "recursive";
+    }
+    return "unknown";
+  }
+
+  void Record(const std::string& node, TVMFFIDefRegionKind kind) {
+    entries.push_back(node + "|" + DefRegionKindName(kind));
+  }
+};
+
+using StructuralVisitTraceNode = Variant<TestStructuralVisitFunc, TestStructuralVisitAdd,
+                                         TestStructuralVisitVar, TestStructuralVisitConst>;
+
+std::string StructuralVisitTraceNodeName(const StructuralVisitTraceNode& node) {
+  if (node.as<TestStructuralVisitFuncObj>() != nullptr) {
+    return "Func";
+  }
+  if (node.as<TestStructuralVisitAddObj>() != nullptr) {
+    return "Add";
+  }
+  if (const auto* var = node.as<TestStructuralVisitVarObj>()) {
+    return "Var(" + std::string(var->name) + ")";
+  }
+  if (const auto* constant = node.as<TestStructuralVisitConstObj>()) {
+    return "Const(" + std::to_string(constant->value) + ")";
+  }
+  TVM_FFI_THROW(TypeError) << "Unsupported structural visit trace node";
+  return "";
+}
+
+TVMFFIAny EncodeStructuralVisitResult(Optional<VisitInterrupt> result) {
+  return details::AnyUnsafe::MoveAnyToTVMFFIAny(
+      Any(Expected<Optional<VisitInterrupt>>(std::move(result))));
+}
+
+TVMFFIAny VisitStructuralVisitVar(StructuralVisitorObj* visitor, const ObjectRef& value) {
+  (void)visitor;
+  const auto* var = value.as<TestStructuralVisitVarObj>();
+  TVM_FFI_ICHECK_NOTNULL(var);
+  return EncodeStructuralVisitResult(std::nullopt);
+}
+
+TVMFFIAny VisitStructuralVisitConst(StructuralVisitorObj* visitor, const ObjectRef& value) {
+  (void)visitor;
+  const auto* constant = value.as<TestStructuralVisitConstObj>();
+  TVM_FFI_ICHECK_NOTNULL(constant);
+  return EncodeStructuralVisitResult(std::nullopt);
+}
+
+TVMFFIAny VisitStructuralVisitAdd(StructuralVisitorObj* visitor, const ObjectRef& value) {
+  const auto* add = value.as<TestStructuralVisitAddObj>();
+  TVM_FFI_ICHECK_NOTNULL(add);
+
+  if (Optional<VisitInterrupt> result = visitor->Visit(add->lhs)) {
+    return EncodeStructuralVisitResult(result);
+  }
+  if (Optional<VisitInterrupt> result = visitor->Visit(add->rhs)) {
+    return EncodeStructuralVisitResult(result);
+  }
+  return EncodeStructuralVisitResult(std::nullopt);
+}
+
+TVMFFIAny VisitStructuralVisitFunc(StructuralVisitorObj* visitor, const ObjectRef& value) {
+  const auto* func = value.as<TestStructuralVisitFuncObj>();
+  TVM_FFI_ICHECK_NOTNULL(func);
+
+  Optional<VisitInterrupt> params_result =
+      visitor->WithDefRegionKind(kTVMFFIDefRegionKindRecursive, [&]() -> Optional<VisitInterrupt> {
+        for (size_t i = 0; i < func->params.size(); ++i) {
+          if (Optional<VisitInterrupt> result = visitor->Visit(func->params[i])) {
+            return result;
+          }
+        }
+        return std::nullopt;
+      });
+  if (params_result) {
+    return EncodeStructuralVisitResult(params_result);
+  }
+
+  if (Optional<VisitInterrupt> result = visitor->Visit(func->body)) {
+    return EncodeStructuralVisitResult(result);
+  }
+  return EncodeStructuralVisitResult(std::nullopt);
+}
+
+ObjectRef MakeStructuralVisitTestIR() {
+  TestStructuralVisitVar x("x");
+  TestStructuralVisitVar y("y");
+  TestStructuralVisitConst one(1);
+  TestStructuralVisitAdd rhs(y, one);
+  TestStructuralVisitAdd body(x, rhs);
+  return TestStructuralVisitFunc(Array<ObjectRef>{x, y}, body);
+}
+
+Array<String> StructuralVisitTrace(const ObjectRef& root) {
+  StructuralVisitTraceState trace;
+  auto callback = [&trace](StructuralVisitTraceNode node, TVMFFIDefRegionKind kind) -> WalkResult {
+    trace.Record(StructuralVisitTraceNodeName(node), kind);
+    return WalkResult::kAdvance;
+  };
+  structuralWalk<TestStructuralVisitFunc, TestStructuralVisitAdd, TestStructuralVisitVar,
+                 TestStructuralVisitConst>(root, callback);
+
+  Array<String> result;
+  for (const std::string& entry : trace.entries) {
+    result.push_back(String(entry));
+  }
+  return result;
 }
 
 // C++-backed enum used by the Python ``Enum`` tests to exercise both
@@ -535,6 +746,33 @@ TVM_FFI_STATIC_INIT_BLOCK() {
       .def_ro("key", &TestEqWithoutHashObj::key)
       .def_ro("label", &TestEqWithoutHashObj::label);
 
+  refl::ObjectDef<TestStructuralVisitVarObj>()
+      .def(refl::init<String>())
+      .def_ro("name", &TestStructuralVisitVarObj::name);
+  refl::TypeAttrDef<TestStructuralVisitVarObj>().attr(
+      refl::type_attr::kStructuralVisit, reinterpret_cast<void*>(&VisitStructuralVisitVar));
+
+  refl::ObjectDef<TestStructuralVisitConstObj>()
+      .def(refl::init<int64_t>())
+      .def_ro("value", &TestStructuralVisitConstObj::value);
+  refl::TypeAttrDef<TestStructuralVisitConstObj>().attr(
+      refl::type_attr::kStructuralVisit, reinterpret_cast<void*>(&VisitStructuralVisitConst));
+
+  refl::ObjectDef<TestStructuralVisitAddObj>()
+      .def(refl::init<ObjectRef, ObjectRef>())
+      .def_ro("lhs", &TestStructuralVisitAddObj::lhs)
+      .def_ro("rhs", &TestStructuralVisitAddObj::rhs);
+  refl::TypeAttrDef<TestStructuralVisitAddObj>().attr(
+      refl::type_attr::kStructuralVisit, reinterpret_cast<void*>(&VisitStructuralVisitAdd));
+
+  refl::ObjectDef<TestStructuralVisitFuncObj>()
+      .def(refl::init<Array<ObjectRef>, ObjectRef>())
+      .def_ro("params", &TestStructuralVisitFuncObj::params,
+              refl::AttachFieldFlag::SEqHashDefRecursive())
+      .def_ro("body", &TestStructuralVisitFuncObj::body);
+  refl::TypeAttrDef<TestStructuralVisitFuncObj>().attr(
+      refl::type_attr::kStructuralVisit, reinterpret_cast<void*>(&VisitStructuralVisitFunc));
+
   refl::GlobalDef()
       .def("testing.test_raise_error", TestRaiseError)
       .def("testing.add_one", [](int x) { return x + 1; })
@@ -569,6 +807,8 @@ TVM_FFI_STATIC_INIT_BLOCK() {
            [](const Optional<TensorView>& t) { return t.has_value(); })
       .def("testing.enum_variant_get",
            [](const String& name) -> Enum { return EnumObj::Get<TestEnumVariantObj>(name); })
+      .def("testing.make_structural_visit_ir", MakeStructuralVisitTestIR)
+      .def("testing.structural_visit_trace", StructuralVisitTrace)
       .def_method("testing.TestIntPairSum", &TestIntPair::Sum, "Get sum of the pair")
       // Container-with-tensor test helpers for DLPack container conversion
       // NOLINTBEGIN(performance-unnecessary-value-param)

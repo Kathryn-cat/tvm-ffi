@@ -49,6 +49,14 @@ impl<'a> AnyView<'a> {
     }
 
     #[inline]
+    pub unsafe fn from_raw_ffi_any(data: TVMFFIAny) -> Self {
+        Self {
+            data,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    #[inline]
     pub fn type_index(&self) -> i32 {
         self.data.type_index
     }
