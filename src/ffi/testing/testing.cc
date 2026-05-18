@@ -29,6 +29,7 @@
 #include <tvm/ffi/dtype.h>
 #include <tvm/ffi/enum.h>
 #include <tvm/ffi/extra/c_env_api.h>
+#include <tvm/ffi/extra/structural_visit.h>
 #include <tvm/ffi/function.h>
 #include <tvm/ffi/optional.h>
 #include <tvm/ffi/reflection/accessor.h>
@@ -39,6 +40,7 @@
 #include <iostream>
 #include <thread>
 #include <utility>
+#include <vector>
 
 namespace tvm {
 namespace ffi {
@@ -79,6 +81,743 @@ TVM_FFI_STATIC_INIT_BLOCK() {
       .def("sum", &TestIntPair::Sum, "Method to compute sum of a and b");
   refl::TypeAttrDef<TestIntPairObj>().def(
       refl::type_attr::kConvert, &refl::details::FFIConvertFromAnyViewToObjectRef<TestIntPair>);
+}
+
+using FTestingStructuralVisit = decltype(StructuralVisitorVTable::visit);
+
+class StructuralVisitUnitLeafObj : public Object {
+ public:
+  std::string name;
+
+  explicit StructuralVisitUnitLeafObj(std::string name) : name(std::move(name)) {}
+
+  static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind = kTVMFFISEqHashKindTreeNode;
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("testing.StructuralVisit.UnitLeaf",
+                                    StructuralVisitUnitLeafObj, Object);
+};
+
+class StructuralVisitUnitPairObj : public Object {
+ public:
+  ObjectRef lhs;
+  ObjectRef rhs;
+
+  StructuralVisitUnitPairObj(ObjectRef lhs, ObjectRef rhs)
+      : lhs(std::move(lhs)), rhs(std::move(rhs)) {}
+
+  static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind = kTVMFFISEqHashKindTreeNode;
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("testing.StructuralVisit.UnitPair",
+                                    StructuralVisitUnitPairObj, Object);
+};
+
+class StructuralVisitUnitIgnoredFieldsObj : public Object {
+ public:
+  ObjectRef visible;
+  ObjectRef ignored;
+  int64_t scalar;
+
+  StructuralVisitUnitIgnoredFieldsObj(ObjectRef visible, ObjectRef ignored, int64_t scalar)
+      : visible(std::move(visible)), ignored(std::move(ignored)), scalar(scalar) {}
+
+  static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind = kTVMFFISEqHashKindTreeNode;
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("testing.StructuralVisit.UnitIgnoredFields",
+                                    StructuralVisitUnitIgnoredFieldsObj, Object);
+};
+
+class StructuralVisitUnitDefRegionFieldsObj : public Object {
+ public:
+  ObjectRef recursive;
+  ObjectRef plain_after_recursive;
+  ObjectRef non_recursive;
+  ObjectRef plain_after_non_recursive;
+
+  StructuralVisitUnitDefRegionFieldsObj(ObjectRef recursive, ObjectRef plain_after_recursive,
+                                        ObjectRef non_recursive,
+                                        ObjectRef plain_after_non_recursive)
+      : recursive(std::move(recursive)),
+        plain_after_recursive(std::move(plain_after_recursive)),
+        non_recursive(std::move(non_recursive)),
+        plain_after_non_recursive(std::move(plain_after_non_recursive)) {}
+
+  static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind = kTVMFFISEqHashKindTreeNode;
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("testing.StructuralVisit.UnitDefRegionFields",
+                                    StructuralVisitUnitDefRegionFieldsObj, Object);
+};
+
+class StructuralVisitOpaqueOverrideParentObj : public Object {
+ public:
+  ObjectRef child;
+
+  explicit StructuralVisitOpaqueOverrideParentObj(ObjectRef child) : child(std::move(child)) {}
+
+  static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind = kTVMFFISEqHashKindTreeNode;
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("testing.StructuralVisit.OpaqueOverrideParent",
+                                    StructuralVisitOpaqueOverrideParentObj, Object);
+};
+
+class StructuralVisitFunctionOverrideParentObj : public Object {
+ public:
+  ObjectRef child;
+
+  explicit StructuralVisitFunctionOverrideParentObj(ObjectRef child) : child(std::move(child)) {}
+
+  static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind = kTVMFFISEqHashKindTreeNode;
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("testing.StructuralVisit.FunctionOverrideParent",
+                                    StructuralVisitFunctionOverrideParentObj, Object);
+};
+
+class StructuralVisitInvalidOverrideParentObj : public Object {
+ public:
+  ObjectRef child;
+
+  explicit StructuralVisitInvalidOverrideParentObj(ObjectRef child) : child(std::move(child)) {}
+
+  static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind = kTVMFFISEqHashKindTreeNode;
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("testing.StructuralVisit.InvalidOverrideParent",
+                                    StructuralVisitInvalidOverrideParentObj, Object);
+};
+
+class StructuralVisitProbeVisitorObj : public StructuralVisitorObj {
+ public:
+  StructuralVisitProbeVisitorObj() : StructuralVisitorObj(VTable()) {}
+
+  std::vector<ObjectRef> visited;
+  std::vector<TVMFFIDefRegionKind> visited_modes;
+  ObjectRef interrupt_on;
+  String interrupt_payload = "stop";
+
+  TVMFFIDefRegionKind CurrentDefRegionKind() const { return def_region_mode_; }
+
+ private:
+  static const StructuralVisitorVTable* VTable() {
+    static const StructuralVisitorVTable vtable{&StructuralVisitProbeVisitorObj::DispatchVisit};
+    return &vtable;
+  }
+
+  static Expected<Optional<VisitInterrupt>> DispatchVisit(StructuralVisitorObj* self,
+                                                          const ObjectRef& value) {
+    return static_cast<StructuralVisitProbeVisitorObj*>(self)->VisitImpl(value);
+  }
+
+  Expected<Optional<VisitInterrupt>> VisitImpl(const ObjectRef& value) {
+    visited.push_back(value);
+    visited_modes.push_back(def_region_mode_);
+    if (interrupt_on.defined() && value.same_as(interrupt_on)) {
+      return Optional<VisitInterrupt>(VisitInterrupt(interrupt_payload));
+    }
+    return Optional<VisitInterrupt>(std::nullopt);
+  }
+};
+
+class StructuralVisitThrowingVisitorObj : public StructuralVisitorObj {
+ public:
+  StructuralVisitThrowingVisitorObj() : StructuralVisitorObj(VTable()) {}
+
+ private:
+  static const StructuralVisitorVTable* VTable() {
+    static const StructuralVisitorVTable vtable{&StructuralVisitThrowingVisitorObj::DispatchVisit};
+    return &vtable;
+  }
+
+  static Expected<Optional<VisitInterrupt>> DispatchVisit(StructuralVisitorObj* self,
+                                                          const ObjectRef& value) {
+    return static_cast<StructuralVisitThrowingVisitorObj*>(self)->VisitImpl(value);
+  }
+
+  Expected<Optional<VisitInterrupt>> VisitImpl(const ObjectRef& value) {
+    TVM_FFI_THROW(ValueError) << "throwing visitor saw " << value.GetTypeKey();
+  }
+};
+
+int structural_visit_opaque_override_calls = 0;
+int structural_visit_function_override_calls = 0;
+bool structural_visit_function_override_saw_visitor = false;
+bool structural_visit_function_override_saw_value = false;
+
+StructuralVisitProbeVisitorObj* AsStructuralVisitProbe(StructuralVisitor visitor) {
+  return static_cast<StructuralVisitProbeVisitorObj*>(
+      const_cast<StructuralVisitorObj*>(visitor.get()));
+}
+
+Expected<Optional<VisitInterrupt>> StructuralVisitOpaqueOverride(StructuralVisitorObj* visitor,
+                                                                 const ObjectRef& value) {
+  TVM_FFI_ICHECK_NOTNULL(visitor);
+  TVM_FFI_ICHECK_EQ(value.type_index(), StructuralVisitOpaqueOverrideParentObj::RuntimeTypeIndex());
+  ++structural_visit_opaque_override_calls;
+  return Optional<VisitInterrupt>(std::nullopt);
+}
+
+TVM_FFI_STATIC_INIT_BLOCK() {
+  namespace refl = tvm::ffi::reflection;
+
+  refl::ObjectDef<StructuralVisitUnitLeafObj>().def_ro("name",
+                                                       &StructuralVisitUnitLeafObj::name);
+  refl::ObjectDef<StructuralVisitUnitPairObj>()
+      .def_ro("lhs", &StructuralVisitUnitPairObj::lhs)
+      .def_ro("rhs", &StructuralVisitUnitPairObj::rhs);
+  refl::ObjectDef<StructuralVisitUnitIgnoredFieldsObj>()
+      .def_ro("visible", &StructuralVisitUnitIgnoredFieldsObj::visible)
+      .def_ro("ignored", &StructuralVisitUnitIgnoredFieldsObj::ignored,
+              refl::AttachFieldFlag::SEqHashIgnore())
+      .def_ro("scalar", &StructuralVisitUnitIgnoredFieldsObj::scalar);
+  refl::ObjectDef<StructuralVisitUnitDefRegionFieldsObj>()
+      .def_ro("recursive", &StructuralVisitUnitDefRegionFieldsObj::recursive,
+              refl::AttachFieldFlag::SEqHashDefRecursive())
+      .def_ro("plain_after_recursive",
+              &StructuralVisitUnitDefRegionFieldsObj::plain_after_recursive)
+      .def_ro("non_recursive", &StructuralVisitUnitDefRegionFieldsObj::non_recursive,
+              refl::AttachFieldFlag::SEqHashDefNonRecursive())
+      .def_ro("plain_after_non_recursive",
+              &StructuralVisitUnitDefRegionFieldsObj::plain_after_non_recursive);
+  refl::ObjectDef<StructuralVisitOpaqueOverrideParentObj>().def_ro(
+      "child", &StructuralVisitOpaqueOverrideParentObj::child);
+  refl::ObjectDef<StructuralVisitFunctionOverrideParentObj>().def_ro(
+      "child", &StructuralVisitFunctionOverrideParentObj::child);
+  refl::ObjectDef<StructuralVisitInvalidOverrideParentObj>().def_ro(
+      "child", &StructuralVisitInvalidOverrideParentObj::child);
+
+  refl::EnsureTypeAttrColumn(refl::type_attr::kStructuralVisit);
+  refl::TypeAttrDef<StructuralVisitOpaqueOverrideParentObj>().attr(
+      refl::type_attr::kStructuralVisit,
+      reinterpret_cast<void*>(static_cast<FTestingStructuralVisit>(&StructuralVisitOpaqueOverride)));
+  refl::TypeAttrDef<StructuralVisitFunctionOverrideParentObj>().def(
+      refl::type_attr::kStructuralVisit,
+      [](StructuralVisitor visitor, ObjectRef value) -> Optional<VisitInterrupt> {
+        ++structural_visit_function_override_calls;
+        structural_visit_function_override_saw_visitor = visitor.defined();
+        structural_visit_function_override_saw_value =
+            value.type_index() == StructuralVisitFunctionOverrideParentObj::RuntimeTypeIndex();
+        return std::nullopt;
+      });
+  refl::TypeAttrDef<StructuralVisitInvalidOverrideParentObj>().attr(
+      refl::type_attr::kStructuralVisit, String("not a structural visit function"));
+
+  refl::GlobalDef()
+      .def("testing.structural_visit_make_leaf",
+           [](String name) -> ObjectRef {
+             return ObjectRef(make_object<StructuralVisitUnitLeafObj>(std::string(name)));
+           })
+      .def("testing.structural_visit_make_pair",
+           [](ObjectRef lhs, ObjectRef rhs) -> ObjectRef {
+             return ObjectRef(
+                 make_object<StructuralVisitUnitPairObj>(std::move(lhs), std::move(rhs)));
+           })
+      .def("testing.structural_visit_make_ignored_fields",
+           [](ObjectRef visible, ObjectRef ignored, int64_t scalar) -> ObjectRef {
+             return ObjectRef(make_object<StructuralVisitUnitIgnoredFieldsObj>(
+                 std::move(visible), std::move(ignored), scalar));
+           })
+      .def("testing.structural_visit_make_def_region_fields",
+           [](ObjectRef recursive, ObjectRef plain_after_recursive, ObjectRef non_recursive,
+              ObjectRef plain_after_non_recursive) -> ObjectRef {
+             return ObjectRef(make_object<StructuralVisitUnitDefRegionFieldsObj>(
+                 std::move(recursive), std::move(plain_after_recursive), std::move(non_recursive),
+                 std::move(plain_after_non_recursive)));
+           })
+      .def("testing.structural_visit_make_opaque_override_parent",
+           [](ObjectRef child) -> ObjectRef {
+             return ObjectRef(
+                 make_object<StructuralVisitOpaqueOverrideParentObj>(std::move(child)));
+           })
+      .def("testing.structural_visit_make_function_override_parent",
+           [](ObjectRef child) -> ObjectRef {
+             return ObjectRef(
+                 make_object<StructuralVisitFunctionOverrideParentObj>(std::move(child)));
+           })
+      .def("testing.structural_visit_make_invalid_override_parent",
+           [](ObjectRef child) -> ObjectRef {
+             return ObjectRef(
+                 make_object<StructuralVisitInvalidOverrideParentObj>(std::move(child)));
+           })
+      .def("testing.structural_visit_make_probe_visitor",
+           []() -> StructuralVisitor {
+             return StructuralVisitor(make_object<StructuralVisitProbeVisitorObj>());
+           })
+      .def("testing.structural_visit_make_throwing_visitor",
+           []() -> StructuralVisitor {
+             return StructuralVisitor(make_object<StructuralVisitThrowingVisitorObj>());
+           })
+      .def("testing.structural_visit_probe_set_interrupt",
+           [](StructuralVisitor visitor, ObjectRef value, String payload) {
+             StructuralVisitProbeVisitorObj* probe = AsStructuralVisitProbe(visitor);
+             probe->interrupt_on = std::move(value);
+             probe->interrupt_payload = std::move(payload);
+           })
+      .def("testing.structural_visit_probe_visited_size",
+           [](StructuralVisitor visitor) -> int64_t {
+             return static_cast<int64_t>(AsStructuralVisitProbe(visitor)->visited.size());
+           })
+      .def("testing.structural_visit_probe_visited",
+           [](StructuralVisitor visitor, int64_t index) -> ObjectRef {
+             return AsStructuralVisitProbe(visitor)->visited.at(index);
+           })
+      .def("testing.structural_visit_probe_visited_mode",
+           [](StructuralVisitor visitor, int64_t index) -> int64_t {
+             return AsStructuralVisitProbe(visitor)->visited_modes.at(index);
+           })
+      .def("testing.structural_visit_probe_current_mode",
+           [](StructuralVisitor visitor) -> int64_t {
+             return AsStructuralVisitProbe(visitor)->CurrentDefRegionKind();
+           })
+      .def("testing.structural_visit_override_reset",
+           []() {
+             structural_visit_opaque_override_calls = 0;
+             structural_visit_function_override_calls = 0;
+             structural_visit_function_override_saw_visitor = false;
+             structural_visit_function_override_saw_value = false;
+           })
+      .def("testing.structural_visit_opaque_override_calls",
+           []() -> int64_t { return structural_visit_opaque_override_calls; })
+      .def("testing.structural_visit_function_override_calls",
+           []() -> int64_t { return structural_visit_function_override_calls; })
+      .def("testing.structural_visit_function_override_saw_visitor",
+           []() -> bool { return structural_visit_function_override_saw_visitor; })
+      .def("testing.structural_visit_function_override_saw_value",
+           []() -> bool { return structural_visit_function_override_saw_value; });
+}
+
+class StructuralVisitVarObj : public Object {
+ public:
+  String name;
+
+  explicit StructuralVisitVarObj(String name) : name(std::move(name)) {}
+
+  static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind = kTVMFFISEqHashKindFreeVar;
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("testing.StructuralVisit.Var", StructuralVisitVarObj, Object);
+};
+
+class StructuralVisitVar : public ObjectRef {
+ public:
+  explicit StructuralVisitVar(String name) {
+    data_ = make_object<StructuralVisitVarObj>(std::move(name));
+  }
+
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(StructuralVisitVar, ObjectRef,
+                                                StructuralVisitVarObj);
+};
+
+class StructuralVisitConstObj : public Object {
+ public:
+  int64_t value;
+
+  explicit StructuralVisitConstObj(int64_t value) : value(value) {}
+
+  static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind = kTVMFFISEqHashKindTreeNode;
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("testing.StructuralVisit.Const", StructuralVisitConstObj,
+                                    Object);
+};
+
+class StructuralVisitConst : public ObjectRef {
+ public:
+  explicit StructuralVisitConst(int64_t value) {
+    data_ = make_object<StructuralVisitConstObj>(value);
+  }
+
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(StructuralVisitConst, ObjectRef,
+                                                StructuralVisitConstObj);
+};
+
+class StructuralVisitAddObj : public Object {
+ public:
+  ObjectRef lhs;
+  ObjectRef rhs;
+
+  StructuralVisitAddObj(ObjectRef lhs, ObjectRef rhs) : lhs(std::move(lhs)), rhs(std::move(rhs)) {}
+
+  static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind = kTVMFFISEqHashKindTreeNode;
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("testing.StructuralVisit.Add", StructuralVisitAddObj, Object);
+};
+
+class StructuralVisitAdd : public ObjectRef {
+ public:
+  StructuralVisitAdd(ObjectRef lhs, ObjectRef rhs) {
+    data_ = make_object<StructuralVisitAddObj>(std::move(lhs), std::move(rhs));
+  }
+
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(StructuralVisitAdd, ObjectRef,
+                                                StructuralVisitAddObj);
+};
+
+class StructuralVisitSeqObj : public Object {
+ public:
+  Array<ObjectRef> stmts;
+
+  explicit StructuralVisitSeqObj(Array<ObjectRef> stmts) : stmts(std::move(stmts)) {}
+
+  static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind = kTVMFFISEqHashKindTreeNode;
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("testing.StructuralVisit.Seq", StructuralVisitSeqObj, Object);
+};
+
+class StructuralVisitSeq : public ObjectRef {
+ public:
+  explicit StructuralVisitSeq(Array<ObjectRef> stmts) {
+    data_ = make_object<StructuralVisitSeqObj>(std::move(stmts));
+  }
+
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(StructuralVisitSeq, ObjectRef,
+                                                StructuralVisitSeqObj);
+};
+
+class StructuralVisitLetObj : public Object {
+ public:
+  StructuralVisitVar var;
+  ObjectRef value;
+  StructuralVisitSeq body;
+
+  StructuralVisitLetObj(StructuralVisitVar var, ObjectRef value, StructuralVisitSeq body)
+      : var(std::move(var)), value(std::move(value)), body(std::move(body)) {}
+
+  static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind = kTVMFFISEqHashKindTreeNode;
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("testing.StructuralVisit.Let", StructuralVisitLetObj, Object);
+};
+
+class StructuralVisitLet : public ObjectRef {
+ public:
+  StructuralVisitLet(StructuralVisitVar var, ObjectRef value, StructuralVisitSeq body) {
+    data_ = make_object<StructuralVisitLetObj>(std::move(var), std::move(value), std::move(body));
+  }
+
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(StructuralVisitLet, ObjectRef,
+                                                StructuralVisitLetObj);
+};
+
+class StructuralVisitIfThenElseObj : public Object {
+ public:
+  ObjectRef cond;
+  StructuralVisitSeq then_branch;
+  StructuralVisitSeq else_branch;
+
+  StructuralVisitIfThenElseObj(ObjectRef cond, StructuralVisitSeq then_branch,
+                               StructuralVisitSeq else_branch)
+      : cond(std::move(cond)),
+        then_branch(std::move(then_branch)),
+        else_branch(std::move(else_branch)) {}
+
+  static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind = kTVMFFISEqHashKindTreeNode;
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("testing.StructuralVisit.IfThenElse",
+                                    StructuralVisitIfThenElseObj, Object);
+};
+
+class StructuralVisitIfThenElse : public ObjectRef {
+ public:
+  StructuralVisitIfThenElse(ObjectRef cond, StructuralVisitSeq then_branch,
+                            StructuralVisitSeq else_branch) {
+    data_ = make_object<StructuralVisitIfThenElseObj>(std::move(cond), std::move(then_branch),
+                                                      std::move(else_branch));
+  }
+
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(StructuralVisitIfThenElse, ObjectRef,
+                                                StructuralVisitIfThenElseObj);
+};
+
+class StructuralVisitFuncObj : public Object {
+ public:
+  Array<StructuralVisitVar> params;
+  StructuralVisitSeq body;
+  String name;
+
+  StructuralVisitFuncObj(Array<StructuralVisitVar> params, StructuralVisitSeq body, String name)
+      : params(std::move(params)), body(std::move(body)), name(std::move(name)) {}
+
+  static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind = kTVMFFISEqHashKindTreeNode;
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("testing.StructuralVisit.Func", StructuralVisitFuncObj,
+                                    Object);
+};
+
+class StructuralVisitFunc : public ObjectRef {
+ public:
+  StructuralVisitFunc(Array<StructuralVisitVar> params, StructuralVisitSeq body, String name) {
+    data_ = make_object<StructuralVisitFuncObj>(std::move(params), std::move(body),
+                                                std::move(name));
+  }
+
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(StructuralVisitFunc, ObjectRef,
+                                                StructuralVisitFuncObj);
+};
+
+class StructuralVisitCallObj : public Object {
+ public:
+  ObjectRef callee;
+  Array<ObjectRef> args;
+  String debug_name;
+
+  StructuralVisitCallObj(ObjectRef callee, Array<ObjectRef> args, String debug_name)
+      : callee(std::move(callee)), args(std::move(args)), debug_name(std::move(debug_name)) {}
+
+  static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind = kTVMFFISEqHashKindTreeNode;
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("testing.StructuralVisit.Call", StructuralVisitCallObj,
+                                    Object);
+};
+
+class StructuralVisitCall : public ObjectRef {
+ public:
+  StructuralVisitCall(ObjectRef callee, Array<ObjectRef> args, String debug_name) {
+    data_ = make_object<StructuralVisitCallObj>(std::move(callee), std::move(args),
+                                                std::move(debug_name));
+  }
+
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(StructuralVisitCall, ObjectRef,
+                                                StructuralVisitCallObj);
+};
+
+class StructuralVisitIRRecordingVisitorObj : public StructuralVisitorObj {
+ public:
+  StructuralVisitIRRecordingVisitorObj() : StructuralVisitorObj(VTable()) {}
+
+  std::vector<ObjectRef> visited;
+  std::vector<TVMFFIDefRegionKind> modes;
+
+ private:
+  static const StructuralVisitorVTable* VTable() {
+    static const StructuralVisitorVTable vtable{
+        &StructuralVisitIRRecordingVisitorObj::DispatchVisit};
+    return &vtable;
+  }
+
+  static Expected<Optional<VisitInterrupt>> DispatchVisit(StructuralVisitorObj* self,
+                                                          const ObjectRef& value) {
+    return static_cast<StructuralVisitIRRecordingVisitorObj*>(self)->VisitImpl(value);
+  }
+
+  Expected<Optional<VisitInterrupt>> VisitImpl(const ObjectRef& value) {
+    visited.push_back(value);
+    modes.push_back(def_region_mode_);
+    return DefaultVisitExpected(value);
+  }
+};
+
+Expected<Optional<VisitInterrupt>> StructuralVisitCallVisit(StructuralVisitorObj* visitor,
+                                                            const ObjectRef& value) {
+  StructuralVisitCall call = value.as<StructuralVisitCall>().value();
+  for (int64_t i = static_cast<int64_t>(call->args.size()); i > 0; --i) {
+    Expected<Optional<VisitInterrupt>> interrupt = visitor->VisitExpected(call->args[i - 1]);
+    if (interrupt.is_err() || interrupt.value().has_value()) {
+      return interrupt;
+    }
+  }
+  return Optional<VisitInterrupt>(std::nullopt);
+}
+
+Expected<Optional<VisitInterrupt>> StructuralVisitIfThenElseVisit(StructuralVisitorObj* visitor,
+                                                                  const ObjectRef& value) {
+  StructuralVisitIfThenElse node = value.as<StructuralVisitIfThenElse>().value();
+  Expected<Optional<VisitInterrupt>> interrupt = visitor->VisitExpected(node->cond);
+  if (interrupt.is_err() || interrupt.value().has_value()) {
+    return interrupt;
+  }
+  interrupt = visitor->VisitExpected(node->else_branch);
+  if (interrupt.is_err() || interrupt.value().has_value()) {
+    return interrupt;
+  }
+  return visitor->VisitExpected(node->then_branch);
+}
+
+Expected<Optional<VisitInterrupt>> StructuralVisitLetVisit(StructuralVisitorObj* visitor,
+                                                           const ObjectRef& value) {
+  StructuralVisitLet node = value.as<StructuralVisitLet>().value();
+  Expected<Optional<VisitInterrupt>> interrupt =
+      visitor->WithDefRegionKindExpected(kTVMFFIDefRegionKindNonRecursive, [&]() {
+        return visitor->VisitExpected(node->var);
+      });
+  if (interrupt.is_err() || interrupt.value().has_value()) {
+    return interrupt;
+  }
+  interrupt = visitor->VisitExpected(node->value);
+  if (interrupt.is_err() || interrupt.value().has_value()) {
+    return interrupt;
+  }
+  return visitor->VisitExpected(node->body);
+}
+
+Expected<Optional<VisitInterrupt>> StructuralVisitFuncVisit(StructuralVisitorObj* visitor,
+                                                            const ObjectRef& value) {
+  StructuralVisitFunc node = value.as<StructuralVisitFunc>().value();
+  Expected<Optional<VisitInterrupt>> interrupt =
+      visitor->WithDefRegionKindExpected(kTVMFFIDefRegionKindRecursive, [&]() {
+        return visitor->VisitExpected(node->params);
+      });
+  if (interrupt.is_err() || interrupt.value().has_value()) {
+    return interrupt;
+  }
+  return visitor->VisitExpected(node->body);
+}
+
+std::string StructuralVisitVarName(const StructuralVisitVar& var) {
+  return var->name.operator std::string();
+}
+
+String StructuralVisitIRKind(const ObjectRef& node) {
+  if (auto n = node.as<StructuralVisitFunc>()) {
+    return "func";
+  } else if (auto n = node.as<StructuralVisitSeq>()) {
+    return "seq";
+  } else if (auto n = node.as<StructuralVisitLet>()) {
+    return "let";
+  } else if (auto n = node.as<StructuralVisitIfThenElse>()) {
+    return "if";
+  } else if (auto n = node.as<StructuralVisitCall>()) {
+    return "call";
+  } else if (auto n = node.as<StructuralVisitAdd>()) {
+    return "add";
+  } else if (auto n = node.as<StructuralVisitVar>()) {
+    return "var";
+  } else if (auto n = node.as<StructuralVisitConst>()) {
+    return "const";
+  }
+  return "";
+}
+
+String StructuralVisitIRLabel(const ObjectRef& node) {
+  if (auto n = node.as<StructuralVisitVar>()) {
+    return "var:" + StructuralVisitVarName(*n);
+  } else if (auto n = node.as<StructuralVisitConst>()) {
+    return "const:" + std::to_string((*n)->value);
+  }
+  return StructuralVisitIRKind(node);
+}
+
+StructuralVisitVar StructuralVisitAsVar(ObjectRef value) {
+  return value.as<StructuralVisitVar>().value();
+}
+
+Array<StructuralVisitVar> StructuralVisitAsVarArray(Array<ObjectRef> values) {
+  Array<StructuralVisitVar> vars;
+  for (const ObjectRef& value : values) {
+    vars.push_back(StructuralVisitAsVar(value));
+  }
+  return vars;
+}
+
+Array<String> StructuralVisitMakeStringArray(const std::vector<String>& values) {
+  return Array<String>(values.begin(), values.end());
+}
+
+String StructuralVisitModeName(TVMFFIDefRegionKind mode) {
+  switch (mode) {
+    case kTVMFFIDefRegionKindNone:
+      return "none";
+    case kTVMFFIDefRegionKindRecursive:
+      return "recursive";
+    case kTVMFFIDefRegionKindNonRecursive:
+      return "non_recursive";
+  }
+  return "unknown";
+}
+
+StructuralVisitIRRecordingVisitorObj* AsStructuralVisitIRRecordingVisitor(
+    StructuralVisitor visitor) {
+  return static_cast<StructuralVisitIRRecordingVisitorObj*>(
+      const_cast<StructuralVisitorObj*>(visitor.get()));
+}
+
+Array<String> StructuralVisitIRRecordingTrace(StructuralVisitor visitor) {
+  StructuralVisitIRRecordingVisitorObj* recorder = AsStructuralVisitIRRecordingVisitor(visitor);
+  std::vector<String> trace;
+  for (const ObjectRef& node : recorder->visited) {
+    String label = StructuralVisitIRLabel(node);
+    if (!label.empty()) {
+      trace.push_back(std::move(label));
+    }
+  }
+  return StructuralVisitMakeStringArray(trace);
+}
+
+Array<String> StructuralVisitIRRecordingVarModes(StructuralVisitor visitor) {
+  StructuralVisitIRRecordingVisitorObj* recorder = AsStructuralVisitIRRecordingVisitor(visitor);
+  std::vector<String> modes;
+  for (size_t i = 0; i < recorder->visited.size(); ++i) {
+    if (auto var = recorder->visited[i].as<StructuralVisitVar>()) {
+      modes.push_back(StructuralVisitVarName(*var) + ":" +
+                      StructuralVisitModeName(recorder->modes[i]).operator std::string());
+    }
+  }
+  return StructuralVisitMakeStringArray(modes);
+}
+
+TVM_FFI_STATIC_INIT_BLOCK() {
+  namespace refl = tvm::ffi::reflection;
+  refl::ObjectDef<StructuralVisitVarObj>().def_ro(
+      "name", &StructuralVisitVarObj::name, refl::AttachFieldFlag::SEqHashIgnore());
+  refl::ObjectDef<StructuralVisitConstObj>().def_ro("value", &StructuralVisitConstObj::value);
+  refl::ObjectDef<StructuralVisitAddObj>()
+      .def_ro("lhs", &StructuralVisitAddObj::lhs)
+      .def_ro("rhs", &StructuralVisitAddObj::rhs);
+  refl::ObjectDef<StructuralVisitLetObj>()
+      .def_ro("var", &StructuralVisitLetObj::var, refl::AttachFieldFlag::SEqHashDefNonRecursive())
+      .def_ro("value", &StructuralVisitLetObj::value)
+      .def_ro("body", &StructuralVisitLetObj::body);
+  refl::ObjectDef<StructuralVisitIfThenElseObj>()
+      .def_ro("cond", &StructuralVisitIfThenElseObj::cond)
+      .def_ro("then_branch", &StructuralVisitIfThenElseObj::then_branch)
+      .def_ro("else_branch", &StructuralVisitIfThenElseObj::else_branch);
+  refl::ObjectDef<StructuralVisitSeqObj>().def_ro("stmts", &StructuralVisitSeqObj::stmts);
+  refl::ObjectDef<StructuralVisitFuncObj>()
+      .def_ro("params", &StructuralVisitFuncObj::params,
+              refl::AttachFieldFlag::SEqHashDefRecursive())
+      .def_ro("body", &StructuralVisitFuncObj::body)
+      .def_ro("name", &StructuralVisitFuncObj::name, refl::AttachFieldFlag::SEqHashIgnore());
+  refl::ObjectDef<StructuralVisitCallObj>()
+      .def_ro("callee", &StructuralVisitCallObj::callee)
+      .def_ro("args", &StructuralVisitCallObj::args)
+      .def_ro("debug_name", &StructuralVisitCallObj::debug_name,
+              refl::AttachFieldFlag::SEqHashIgnore());
+  refl::EnsureTypeAttrColumn(refl::type_attr::kStructuralVisit);
+  refl::TypeAttrDef<StructuralVisitCallObj>().attr(
+      refl::type_attr::kStructuralVisit,
+      reinterpret_cast<void*>(static_cast<FTestingStructuralVisit>(&StructuralVisitCallVisit)));
+  refl::TypeAttrDef<StructuralVisitIfThenElseObj>().attr(
+      refl::type_attr::kStructuralVisit,
+      reinterpret_cast<void*>(
+          static_cast<FTestingStructuralVisit>(&StructuralVisitIfThenElseVisit)));
+  refl::TypeAttrDef<StructuralVisitLetObj>().attr(
+      refl::type_attr::kStructuralVisit,
+      reinterpret_cast<void*>(static_cast<FTestingStructuralVisit>(&StructuralVisitLetVisit)));
+  refl::TypeAttrDef<StructuralVisitFuncObj>().attr(
+      refl::type_attr::kStructuralVisit,
+      reinterpret_cast<void*>(static_cast<FTestingStructuralVisit>(&StructuralVisitFuncVisit)));
+
+  refl::GlobalDef()
+      .def("testing.structural_visit_ir_make_var",
+           [](String name) -> ObjectRef { return StructuralVisitVar(std::move(name)); })
+      .def("testing.structural_visit_ir_make_const",
+           [](int64_t value) -> ObjectRef { return StructuralVisitConst(value); })
+      .def("testing.structural_visit_ir_make_add",
+           [](ObjectRef lhs, ObjectRef rhs) -> ObjectRef {
+             return StructuralVisitAdd(std::move(lhs), std::move(rhs));
+           })
+      .def("testing.structural_visit_ir_make_seq",
+           [](Array<ObjectRef> stmts) -> ObjectRef { return StructuralVisitSeq(std::move(stmts)); })
+      .def("testing.structural_visit_ir_make_let",
+           [](ObjectRef var, ObjectRef value, ObjectRef body) -> ObjectRef {
+             return StructuralVisitLet(StructuralVisitAsVar(std::move(var)), std::move(value),
+                                       body.as<StructuralVisitSeq>().value());
+           })
+      .def("testing.structural_visit_ir_make_if",
+           [](ObjectRef cond, ObjectRef then_branch, ObjectRef else_branch) -> ObjectRef {
+             return StructuralVisitIfThenElse(std::move(cond),
+                                              then_branch.as<StructuralVisitSeq>().value(),
+                                              else_branch.as<StructuralVisitSeq>().value());
+           })
+      .def("testing.structural_visit_ir_make_func",
+           [](Array<ObjectRef> params, ObjectRef body, String name) -> ObjectRef {
+             return StructuralVisitFunc(StructuralVisitAsVarArray(std::move(params)),
+                                        body.as<StructuralVisitSeq>().value(), std::move(name));
+           })
+      .def("testing.structural_visit_ir_make_call",
+           [](ObjectRef callee, Array<ObjectRef> args, String debug_name) -> ObjectRef {
+             return StructuralVisitCall(std::move(callee), std::move(args), std::move(debug_name));
+           })
+      .def("testing.structural_visit_ir_make_recording_visitor", []() -> StructuralVisitor {
+        return StructuralVisitor(make_object<StructuralVisitIRRecordingVisitorObj>());
+      })
+      .def("testing.structural_visit_ir_kind", StructuralVisitIRKind)
+      .def("testing.structural_visit_ir_label", StructuralVisitIRLabel)
+      .def("testing.structural_visit_ir_var_name",
+           [](ObjectRef node) -> String {
+             return StructuralVisitVarName(node.as<StructuralVisitVar>().value());
+           })
+      .def("testing.structural_visit_ir_recording_trace", StructuralVisitIRRecordingTrace)
+      .def("testing.structural_visit_ir_recording_var_modes",
+           StructuralVisitIRRecordingVarModes);
 }
 
 // C++-backed enum used by the Python ``Enum`` tests to exercise both
