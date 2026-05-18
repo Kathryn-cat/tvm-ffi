@@ -467,6 +467,40 @@ inline constexpr const char* kSHash = "__s_hash__";
  */
 inline constexpr const char* kSEqual = "__s_equal__";
 /*!
+ * \brief Custom structural visitor hook (used by ``StructuralVisitor``).
+ *
+ * The hook receives the active visitor and the current object value. It should
+ * visit structural child values through the provided visitor and return an
+ * optional ``VisitInterrupt`` when traversal should stop.
+ *
+ * Value type: either an opaque function pointer to a C++ structural visit hook
+ *
+ * ``Optional<VisitInterrupt> (*)(StructuralVisitorObj* visitor, const ObjectRef& value)``
+ *
+ * or an ``ffi::Function`` with signature
+ *
+ * ``(StructuralVisitor visitor, ObjectRef value) -> Optional<VisitInterrupt>``.
+ *
+ * The opaque function pointer returns ``None`` for no interrupt, or a
+ * ``VisitInterrupt`` to halt traversal. The ``visitor`` parameter is the
+ * active traversal context used to recursively visit structural children.
+ */
+inline constexpr const char* kStructuralVisit = "__ffi_structural_visit__";
+/*!
+ * \brief Custom structural mapper hook (used by ``StructuralMapper``).
+ *
+ * Value type: opaque function pointer with signature
+ * ``Any (*)(StructuralMapper* mapper, AnyView value)``.
+ */
+inline constexpr const char* kStructuralMap = "__ffi_structural_map__";
+/*!
+ * \brief Custom in-place structural mutator hook (used by ``StructuralMapper``).
+ *
+ * Value type: opaque function pointer with signature
+ * ``Any (*)(StructuralMapper* mapper, ObjectRef&& value)``.
+ */
+inline constexpr const char* kStructuralInplaceMutator = "__ffi_structural_inplace_mutator__";
+/*!
  * \brief Serialize object data to a JSON-compatible ``Map``.
  *
  * If registered, ``ToJSONGraph`` calls this instead of the default
