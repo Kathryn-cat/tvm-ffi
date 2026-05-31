@@ -22,13 +22,18 @@ import importlib
 import pytest
 import tilus  # Registers the Tilus dialect.
 import tvm_ffi
+from tvm_ffi import dataclasses as dc
 from tvm_ffi import std
 from tvm_ffi._pyast_parser import parse
 
 
 def _input_vars(node: object) -> dict[str, std.Var]:
-    inputs = getattr(node, "inputs", ())
-    return {value.name: value for value in inputs if isinstance(value, std.Var)}
+    values = (
+        getattr(node, field.name)
+        for field in dc.fields(type(node))
+        if field.lang_kind == "arg" and field.name is not None
+    )
+    return {value.name: value for value in values if isinstance(value, std.Var)}
 
 
 def _round_trip(node: object) -> None:
@@ -105,8 +110,8 @@ dst = tilus.LoadGlobal(
     src = std.Var(src_ty, "src")
     dst_ty = tensor_mod.register_tensor("float32", (16, 32), layout=reg_layout)
     expected = inst_mod.LoadGlobalInst(
+        src,
         output=std.Var(dst_ty, "dst"),
-        inputs=[src],
         offsets=[0, 0],
         dims=[0, 1],
     )
@@ -148,8 +153,8 @@ dst = tilus.LoadShared(
         layout=layout_mod.register_layout((8,), mode_shape=(8,), local_modes=(0,)),
     )
     expected = inst_mod.LoadSharedInst(
+        std.Var(shared_ty, "shared"),
         output=std.Var(dst_ty, "dst"),
-        inputs=[std.Var(shared_ty, "shared")],
     )
 
     parsed = parse(source, extra_vars={"shared": std.Var(shared_ty, "shared")})
@@ -170,21 +175,17 @@ dst = tilus.LoadGlobal(
 """
 
     src = std.Var(tilus.GlobalTensor("float32", 16), "src")
-    with pytest.raises(TypeError, match="must match operand 0 type"):
+    with pytest.raises(TypeError, match="must match src dtype and storage scope"):
         parse(source, extra_vars={"src": src})
 
 
-def test_parse_tensor_optional_layout_alias_is_rejected() -> None:
+def test_parse_tensor_optional_layout_alias_matches_default_printer() -> None:
     _import("tilus._tilus_lang")
 
     source = "tilus.RegTensor(std.f32, 2, 2, optional_layout=None)"
+    expected = tilus.RegTensor("float32", 2, 2)
 
-    try:
-        parse(source)
-    except TypeError as err:
-        assert "unexpected keyword argument 'optional_layout'" in str(err)
-    else:
-        raise AssertionError("expected optional_layout alias to fail")
+    assert tvm_ffi.structural_equal(parse(source), expected)
 
 
 def test_parse_instruction_binding_inside_function() -> None:
@@ -207,7 +208,7 @@ def kernel(x: tilus.RegTensor(std.f32, 2, 2)):
         args=[x],
         ret_type=None,
         body=[
-            inst_mod.AddInst(inputs=[x, x], output=y),
+            inst_mod.AddInst(x, x, output=y),
             std.Return(y),
         ],
         metadata=None,
@@ -229,7 +230,7 @@ with std.scope(tilus.TensorItemValue(tilus.RegTensor(std.f32, 2, 2))) as v:
 """
     ty = tensor_mod.register_tensor("float32", (2, 2))
     v = std.Var(ty, "v")
-    expected = std.Scope([stmt_mod.TensorItemValue(ty, v)], [std.Return(v)])
+    expected = std.Scope([stmt_mod.TensorItemValue(v)], [std.Return(v)])
 
     parsed = parse(source)
     assert tvm_ffi.structural_equal(parsed, expected)
